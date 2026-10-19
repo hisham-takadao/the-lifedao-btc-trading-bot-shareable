@@ -1,5 +1,5 @@
 """
-Start the lifedao BTC trading bot.
+Start The Lifedao BTC Trading Bot.
 
     python run_bot.py
 
@@ -174,7 +174,7 @@ def main() -> None:
         print(f"Setup problem: {e}")
         sys.exit(1)
     setup_logging(settings.data_dir)
-    log.info("lifedao BTC trading bot starting. Data folder: %s", settings.data_dir)
+    log.info("The Lifedao BTC Trading Bot starting. Data folder: %s", settings.data_dir)
     preflight(settings.wallet_address)
 
     store = LocalStore(settings.data_dir)
