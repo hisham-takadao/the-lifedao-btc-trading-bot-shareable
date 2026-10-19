@@ -1,4 +1,4 @@
-# lifedao BTC trading bot
+# The Lifedao BTC trading bot
 
 An automatic trading bot that trades **WBTC/USDC on Uniswap V3 (Arbitrum One)** with real money, from your own wallet. You give it the private key of a dedicated wallet holding USDC. It runs 24/7, and every 4 hours it decides whether to buy or sell. **It executes immediately, with no approval step.**
 
