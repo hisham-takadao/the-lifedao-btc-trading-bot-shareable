@@ -1,0 +1,5 @@
+numpy>=2.0,<3.0
+requests>=2.31,<3.0
+eth_account>=0.13,<0.14
+eth_abi>=5.0,<7.0
+pycryptodome>=3.19,<4.0

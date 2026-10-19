@@ -1,0 +1,8 @@
+# Your private key lives here: never commit it.
+.env
+# The bot's memory and logs.
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
