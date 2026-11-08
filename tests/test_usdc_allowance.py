@@ -95,7 +95,9 @@ class FakeSender:
 
 @pytest.fixture
 def script(monkeypatch):
-    module = _load_script()
+    script_module = _load_script()
+    from bot import approvals as module      # the approval logic lives here; the script calls it
+    monkeypatch.setattr(module, "main", script_module.main, raising=False)
     monkeypatch.setenv("WALLET_PRIVATE_KEY", HARDHAT_KEY)
     monkeypatch.delenv("WALLET_ADDRESS", raising=False)
     sender = FakeSender()
