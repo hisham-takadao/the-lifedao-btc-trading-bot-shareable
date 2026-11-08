@@ -84,3 +84,10 @@ MAX_PRICE_STALENESS_PCT = 1.0
 # 24h = 6 cycles for a human to decide; a fresh signal re-proposes at the
 # current price.
 PROPOSAL_MAX_AGE_HOURS = 24
+
+# TWAP guard (2026-11-08): before any swap, the pool's spot price must be
+# within this % of its own 30-minute time-weighted average price, or the
+# trade is skipped and re-checked next cycle. Protects against trading on a
+# momentary spike (e.g. the 2025-10-20 single-transaction wick to $110).
+TWAP_WINDOW_SECONDS = 1800
+MAX_TWAP_DEVIATION_PCT = 1.0

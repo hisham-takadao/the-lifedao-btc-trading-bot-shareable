@@ -48,6 +48,7 @@ SELECTOR_SLOT0 = "0x3850c7bd"     # slot0()
 SELECTOR_TOKEN0 = "0x0dfe1681"    # token0()
 SELECTOR_TOKEN1 = "0xd21220a7"    # token1()
 SELECTOR_FEE = "0xddca3f43"       # fee()
+SELECTOR_OBSERVE = "0x883bdbfd"   # observe(uint32[])
 
 WORD = 32   # bytes per ABI-encoded word
 
@@ -167,3 +168,34 @@ def verify_pool(pool_address: str = config.POOL_ADDRESS) -> None:
             f"Pool address {pool_address} does not match the expected WBTC/USDC pool: "
             + "; ".join(problems)
         )
+
+
+def decode_observe_twap_tick(data: bytes, seconds_ago: int) -> float:
+    """Average tick over the last `seconds_ago` seconds from observe([s, 0]).
+    Return layout: two dynamic arrays (int56[] tickCumulatives, uint160[]
+    secondsPerLiquidityCumulativeX128s): [offset_a, offset_b, len_a, a0, a1,
+    len_b, b0, b1]."""
+    if len(data) < 8 * WORD:
+        raise OnchainError(f"expected at least {8 * WORD} bytes from observe(), got {len(data)}")
+    words = [data[i * WORD:(i + 1) * WORD] for i in range(len(data) // WORD)]
+    off_a = _decode_uint(words[0]) // WORD
+    if _decode_uint(words[off_a]) != 2:
+        raise OnchainError("observe() returned an unexpected number of observations")
+    cum_then, cum_now = _decode_int(words[off_a + 1]), _decode_int(words[off_a + 2])
+    return (cum_now - cum_then) / seconds_ago
+
+
+def tick_to_price(tick: float, decimals0: int = config.WBTC_DECIMALS, decimals1: int = config.USDC_DECIMALS) -> float:
+    """USDC per WBTC at a (possibly fractional, averaged) tick."""
+    return 1.0001 ** tick * 10 ** (decimals0 - decimals1)
+
+
+def get_twap_price(pool_address: str = config.POOL_ADDRESS, seconds_ago: int = 1800) -> float:
+    """The pool's own time-weighted average price over the last `seconds_ago`
+    seconds (Uniswap V3's built-in price record). Read-only. A single
+    transaction can push the spot price anywhere for a moment; it barely
+    moves this average."""
+    data = "0x" + SELECTOR_OBSERVE[2:] + f"{32:064x}" + f"{2:064x}" + f"{seconds_ago:064x}" + f"{0:064x}"
+    result_hex = _rpc_call("eth_call", [{"to": pool_address, "data": data}, "latest"])
+    raw = bytes.fromhex(result_hex[2:] if result_hex.startswith("0x") else result_hex)
+    return tick_to_price(decode_observe_twap_tick(raw, seconds_ago))

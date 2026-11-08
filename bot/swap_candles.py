@@ -1,6 +1,6 @@
 """
-4-hour candles built from every swap in the pool (strategy change A,
-the default since October 2026).
+4-hour candles built from every swap in the pool (the default since
+October 2026).
 
 The 20-minute samples only see 12 prices per window: highs and lows between
 samples are missed, the close is the price at hh:40:05 (20 minutes before
@@ -11,11 +11,20 @@ drifting polls left the live ADX at 21.7 instead of 28.2).
 Here a finished window's candle is read from the pool's own Swap events,
 so it is a fixed fact of the chain, whatever the poll timing or restarts:
   open  = the price after the last swap at or before the window start
-  high  = the highest of the open and every swap price in the window
-  low   = the lowest of the open and every swap price in the window
+  high  = the highest of the open and every transaction's final price in the window
+  low   = the lowest of the open and every transaction's final price in the window
   close = the price after the last swap before the window ends
-(exactly the backtest's "true candles", backtest/src/candles.py). Prices are
+(exactly the original project's backtest "true candles"). Prices are
 the pool's post-swap sqrtPriceX96, converted as everywhere else in the bot.
+
+One price per transaction (2026-11-08): a transaction counts only with the
+pool price after its last swap; prices between swaps of the same
+transaction are ignored, because nobody else can trade at them. On
+2025-10-20 single transactions (e.g. 0xef6923493d...) pushed the pool from
+about $110,800 to $110 and back inside themselves; counting those prices
+gave candles with a $110 low and inflated ATR for about 14 candles. Open
+and close are unaffected (the last swap of a block is always the last swap
+of its transaction).
 
 Read-only: eth_getLogs and block headers only.
 """
@@ -121,15 +130,26 @@ def _sqrt_price(lg: dict) -> int:
     return int(lg["data"][2 + 64 * 2: 2 + 64 * 3], 16)
 
 
+def last_swap_per_transaction(swaps: list[tuple]) -> list[tuple]:
+    """Swaps given as (block, log_index, sqrtPriceX96, tx_hash): only the
+    last swap (highest log index) of each transaction, in chain order."""
+    last: dict = {}
+    for s in sorted(swaps, key=lambda s: (s[0], s[1])):
+        last[(s[0], s[3].lower())] = s
+    return sorted(last.values(), key=lambda s: (s[0], s[1]))
+
+
 def build_candle(window_ts: int, before: list[tuple], inside: list[tuple]) -> Candle:
-    """Pure: the candle from swaps given as (block, log_index, sqrtPriceX96).
-    `before`: swaps at or before the window start (only the last one is
-    used); `inside`: swaps after the window start and before its end."""
+    """Pure: the candle from swaps given as (block, log_index, sqrtPriceX96,
+    tx_hash). `before`: swaps at or before the window start (only the last
+    one is used; tx_hash optional there); `inside`: swaps after the window
+    start and before its end, of which each transaction contributes only its
+    last swap's price."""
     if not before:
         raise OnchainError(f"no swap found before window {window_ts}")
     order = lambda s: (s[0], s[1])
     open_ = price_from_sqrt_price_x96(max(before, key=order)[2])
-    prices = [price_from_sqrt_price_x96(s[2]) for s in sorted(inside, key=order)]
+    prices = [price_from_sqrt_price_x96(s[2]) for s in last_swap_per_transaction(inside)]
     allp = [open_] + prices
     return Candle(timestamp=window_ts, open=open_, high=max(allp), low=min(allp),
                   close=prices[-1] if prices else open_)
@@ -148,7 +168,8 @@ def candle_for_window(window_ts: int, pool: str = config.POOL_ADDRESS) -> tuple[
     while True:
         b_lo = first_block_at_or_after(window_ts - lookback, b_inside_start, cache)
         logs = [lg for lg in get_swap_logs(pool, b_lo, b_end - 1) if lg["address"].lower() == pool.lower()]
-        swaps = [(int(lg["blockNumber"], 16), int(lg["logIndex"], 16), _sqrt_price(lg)) for lg in logs]
+        swaps = [(int(lg["blockNumber"], 16), int(lg["logIndex"], 16), _sqrt_price(lg), lg["transactionHash"])
+                 for lg in logs]
         before = [s for s in swaps if s[0] < b_open_end]
         if before or lookback >= MAX_LOOKBACK_SECONDS:
             break

@@ -10,6 +10,9 @@ Optional settings (see .env.example):
   MAX_TRADE_USD    an upper limit on any single buy, in USD (default: none)
   CANDLE_SOURCE    "swaps" (default): candles from every trade in the pool;
                    "samples": candles from 20-minute price samples
+  TREND_CORE       "on" (default): the Trend Core replaces the Trend Bot's
+                   entries; "off": the Trend Bot trades instead, and any
+                   WBTC the Trend Core holds is sold at the next cycle
   COINGECKO_API_KEY  only used once, for the history warm-up on a fresh start
   WALLET_ADDRESS   optional; if set, must match the address of the key
 """
@@ -53,10 +56,12 @@ class Settings:
     max_trade_usd: Optional[float]
     candle_source: str
     coingecko_api_key: Optional[str]
+    trend_core: bool = True
 
     def __repr__(self) -> str:      # never show the key, even by accident
         return (f"Settings(wallet_address={self.wallet_address!r}, data_dir={str(self.data_dir)!r}, "
-                f"max_trade_usd={self.max_trade_usd!r}, candle_source={self.candle_source!r})")
+                f"max_trade_usd={self.max_trade_usd!r}, candle_source={self.candle_source!r}, "
+                f"trend_core={self.trend_core!r})")
 
     __str__ = __repr__
 
@@ -94,6 +99,11 @@ def load_settings(env_file: Optional[Path] = None) -> Settings:
     if source not in ("swaps", "samples"):
         raise SettingsError(f"CANDLE_SOURCE must be 'swaps' or 'samples', got {source!r}")
 
+    tc = os.environ.get("TREND_CORE", "on").strip().lower() or "on"
+    if tc not in ("on", "off"):
+        raise SettingsError(f"TREND_CORE must be 'on' or 'off', got {tc!r}")
+
     data_dir = Path(os.environ.get("DATA_DIR", "").strip() or ROOT / "data")
     return Settings(private_key=key, wallet_address=address, data_dir=data_dir, max_trade_usd=cap,
-                    candle_source=source, coingecko_api_key=os.environ.get("COINGECKO_API_KEY") or None)
+                    candle_source=source, coingecko_api_key=os.environ.get("COINGECKO_API_KEY") or None,
+                    trend_core=tc == "on")

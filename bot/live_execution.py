@@ -18,8 +18,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .live_config import NetworkConfig, LIVE_SLIPPAGE_TOLERANCE_PCT, MAX_PRICE_STALENESS_PCT
-from .onchain import get_live_price
+from .live_config import (NetworkConfig, LIVE_SLIPPAGE_TOLERANCE_PCT, MAX_PRICE_STALENESS_PCT,
+                          TWAP_WINDOW_SECONDS, MAX_TWAP_DEVIATION_PCT)
+from .onchain import get_live_price, get_twap_price
 from .live_wallet import (
     encode_exact_input_single, compute_min_amount_out, build_and_sign_transaction,
     broadcast_transaction, wait_for_receipt, receipt_succeeded, decode_swap_event,
@@ -41,6 +42,33 @@ class ExecutionRevertedError(LiveWalletError):
     def __init__(self, message: str, tx_hash: str):
         super().__init__(message)
         self.tx_hash = tx_hash
+
+
+class TwapDeviationError(StalePriceError):
+    """The pool's spot price is too far from its own 30-minute average (a
+    momentary spike), or the average couldn't be read. Handled exactly like a
+    stale price: nothing is sent, and the strategy re-checks next cycle."""
+    pass
+
+
+def check_twap(pool_address: str, spot_price: float, max_deviation_pct: float = MAX_TWAP_DEVIATION_PCT,
+               seconds: int = TWAP_WINDOW_SECONDS, twap_reader=get_twap_price) -> float:
+    """Raise TwapDeviationError unless the spot price is within
+    max_deviation_pct of the pool's TWAP. Fails closed: if the TWAP can't be
+    read, the trade is skipped. Returns the TWAP."""
+    try:
+        twap = twap_reader(pool_address, seconds)
+    except Exception as e:  # noqa: BLE001
+        raise TwapDeviationError(f"Couldn't read the pool's {seconds // 60}-minute average price ({e}); "
+                                 f"refusing to trade without it.") from e
+    if twap <= 0:
+        raise TwapDeviationError(f"The pool's {seconds // 60}-minute average price is invalid ({twap}).")
+    deviation = abs(spot_price - twap) / twap * 100
+    if deviation > max_deviation_pct:
+        raise TwapDeviationError(
+            f"Spot price ${spot_price:,.2f} is {deviation:.2f}% from the pool's {seconds // 60}-minute average "
+            f"${twap:,.2f} (limit {max_deviation_pct}%) -- possible temporary spike. Refusing to execute.")
+    return twap
 
 
 @dataclass
@@ -86,6 +114,7 @@ def execute_buy(network: NetworkConfig, private_key_hex: str, wallet_address: st
             f"Price moved {staleness_pct:.2f}% since proposal (limit {max_staleness_pct}%) -- "
             f"proposal price ${price_at_proposal:,.2f}, current ${current_price:,.2f}. Refusing to execute."
         )
+    check_twap(network.pool_address, current_price)
 
     amount_in_raw = int(size_usd * 10 ** network.usdc_decimals)
     expected_wbtc = size_usd / current_price
@@ -134,6 +163,7 @@ def execute_sell(network: NetworkConfig, private_key_hex: str, wallet_address: s
             f"Price moved {staleness_pct:.2f}% since proposal (limit {max_staleness_pct}%) -- "
             f"proposal price ${price_at_proposal:,.2f}, current ${current_price:,.2f}. Refusing to execute."
         )
+    check_twap(network.pool_address, current_price)
 
     amount_in_raw = int(wbtc_qty * 10 ** network.wbtc_decimals)
     expected_usdc = wbtc_qty * current_price
