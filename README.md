@@ -45,59 +45,42 @@ Some rules apply to everything:
 2. On **Arbitrum One**, in that wallet:
    - **USDC** (native USDC, `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`). At least $60, since $50 always stays in reserve and trades are a share of the rest.
    - A little **ETH for gas**. 0.001 ETH is plenty; each trade costs about $0.01.
-3. **Python 3.11 or newer** (python.org) if you run it on your own computer, or a **Railway** account if you run it in the cloud.
+3. To run it on your own computer: nothing else. The start file helps you install Python 3.11+ if it's missing. To run it 24/7 in the cloud: a **Railway** account (about $5 a month).
 
 Start with a wallet holding **only USDC**. The bot manages only the positions it opens itself and never sells WBTC it didn't buy.
 
-## Set up (once)
+## Start it on your computer (easiest)
 
-### 1. Get the code and install
-On Windows (PowerShell), from the folder where you downloaded or cloned this repository:
+1. **Download this project:** on GitHub, click the green **Code** button, then **Download ZIP**. Unzip it into a folder.
+2. **Start it:**
+   - **Windows:** double-click **`Start Bot (Windows).bat`**. If Windows shows "Windows protected your PC", click **More info**, then **Run anyway**.
+   - **Mac:** double-click **`Start Bot (Mac).command`**. The first time, macOS may refuse to open it: right-click it, choose **Open**, then **Open** again.
+   - **Linux:** run `bash start.sh`.
+3. **Follow the steps in the window:**
+   1. If Python isn't installed, it tells you how to get it. On Windows it can install it for you.
+   2. The first time, it installs what the bot needs. That takes a few minutes.
+   3. It asks for your wallet's **private key**. Paste it and press Enter. Nothing shows as you paste; that's normal. It shows the wallet address the key belongs to, so you can check it's the right wallet. The key is saved only in the `.env` file in this folder.
+   4. It checks your wallet: USDC, ETH for gas, and the approvals. If something is missing, it says what to send and waits.
+   5. **One-time approvals.** Uniswap's router can only swap your USDC and WBTC once you approve it. The window explains this and asks you to type `YES`. It's two small transactions costing a fraction of a cent each, and it moves no tokens.
+   6. It starts the bot.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-```
+**After the first time, just double-click the same file:** it goes straight to the checks and starts the bot.
 
-On macOS or Linux:
+- **Keep the window open.** Closing it, or pressing Ctrl+C, stops the bot. Open positions stay in your wallet, and the bot picks them up again when you restart it.
+- **While it runs, the computer won't go to sleep by itself.** But it must stay on and online, and closing a laptop's lid still sleeps it. If the computer is off when a cycle is due, the bot catches up when it's back, so it may sell later than planned. For 24/7 running, use Railway (below).
+- **Every 4 hours the window shows a status line:** BTC price, the Trend Core's score and holding, USDC, and the total.
+- **To use a different wallet,** run `python start.py --new-key` from this folder. If the old wallet's memory is still in the `data` folder, it offers to rename that folder first (it never deletes it).
+- **Optional settings** such as `MAX_TRADE_USD` go in the `.env` file. Open it in Notepad or TextEdit; see **Settings** below.
 
+### The manual way (for developers)
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt     # Windows: .venv\Scripts\python
+cp .env.example .env                                     # then put your key in .env
+.venv/bin/python scripts/check_setup.py                  # read-only check
+.venv/bin/python scripts/approve_tokens.py               # one-time approvals (type YES)
+.venv/bin/python run_bot.py
 ```
-
-### 2. Add your private key
-Copy `.env.example` to a new file named `.env` in the same folder, open it, and replace `your-private-key-here` with your wallet's private key. Save it.
-
-- `.env` never leaves your computer and is excluded from Git. **Never share it, commit it or paste it anywhere.**
-- Optional: set `MAX_TRADE_USD` (for example `25`) to cap every buy while you get familiar with the bot.
-
-### 3. Check your setup (read-only, free)
-```powershell
-.venv\Scripts\python scripts\check_setup.py
-```
-This shows the wallet address worked out from your key, your USDC, WBTC and ETH balances, and whether the approvals are in place. It then lists anything still needed.
-
-### 4. Approve the tokens (one time)
-```powershell
-.venv\Scripts\python scripts\approve_tokens.py
-```
-Uniswap's router can only trade your USDC and WBTC once you approve it. The script sends up to two small transactions, costing a fraction of a cent each.
-- It simulates each one first and asks you to type `YES` before sending.
-- It moves no tokens.
-- It's safe to run again.
-
-### 5. Start the bot
-```powershell
-.venv\Scripts\python run_bot.py
-```
-On first start it prints a summary (wallet, balances, approvals), then warms up its indicators from about 70 days of price history; no trades come from the warm-up. After that:
-- it polls the price every 20 minutes;
-- it runs a trading cycle just after each 4-hour mark: 00, 04, 08, 12, 16 and 20 UTC.
-
-**To stop it, press Ctrl+C.** Open positions stay in your wallet, and the bot picks them up again when you restart it.
-
-On your own computer, the bot only trades while the computer is on, awake and online. For 24/7 running, use Railway (below) or another always-on machine.
 
 ## Where to see what it's doing
 
@@ -110,30 +93,31 @@ Everything is in the `data` folder:
 | `proposals.csv` | Every signal and its outcome (executed, failed, skipped by a guard) |
 | `summary.json` | The latest overview, including the Trend Core's score, target and holding |
 | `bot.log` | The full log |
+| `wallet.txt` | Which wallet this folder belongs to. The bot refuses to use one wallet's memory with another wallet's key |
 | `state.json` | **The bot's memory.** Don't edit or delete it while positions are open, or the bot will forget them |
 
 The `.csv` files open in Excel or Google Sheets.
 
 ## Run it 24/7 on Railway
 
-1. **Create the service:**
+Railway keeps the bot running around the clock, about $5 a month. Your key stays in your own Railway account.
+
+1. **Get your own copy of this project on GitHub:** click **Fork** at the top of this page.
+2. **Create the service:**
    1. Sign in at railway.app.
-   2. Click **New Project → Deploy from GitHub repo** and pick your copy of this repository. Your GitHub account needs access to it.
-2. **Settings → Deploy:**
-   - Set **Custom Start Command** to `python run_bot.py`.
-   - Set **Restart Policy** to **On Failure**.
-   - Keep **Serverless** off: a sleeping bot can't watch prices.
-3. **Add a volume. This is essential.** Railway's disk is wiped on every restart and redeploy, and without a volume the bot would forget its open positions.
+   2. Click **New Project → Deploy from GitHub repo** and pick your copy.
+   3. The start command, restart policy and "never run two copies" settings come from `railway.json` in this project; you don't need to set them.
+3. **Add a volume. This is essential.** Without one, the bot would forget its open positions on every restart. The deploy refuses to run without it.
    1. Right-click the service and choose **Attach Volume**.
    2. Set its mount path to `/data`.
-4. **Variables:**
+4. **Variables:** open the service's **Variables** tab and add:
    - `WALLET_PRIVATE_KEY`: your key. Railway stores it encrypted; never put it in the repository.
    - `DATA_DIR`: `/data`.
-   - Optional: `MAX_TRADE_USD`.
-5. **Run the approval script once on your own computer** (step 4 above). Railway can't answer the `YES` prompt.
-6. **Check it's running.** Open **Deployments**. The newest deployment should show **Active**, and its logs should show the start-up summary and then lines like "Sampled price".
+   - `AUTO_APPROVE`: `yes`. The bot then sends the one-time approvals itself on its first start, so you don't need a computer for that step.
+   - Optional: `MAX_TRADE_USD`, `TREND_CORE`.
+5. **Check it's running.** Open **Deployments**. The newest deployment should show **Active**, and its **Deploy Logs** should show the start-up summary, then "Router approvals are in place", then lines like "Sampled price".
 
-The bot's log appears in Railway's **Deploy Logs**. The data files are on the volume.
+The bot's log appears in Railway's **Deploy Logs**. The data files are on the volume. If a deployment fails while "downloading" its build tools, that's usually a temporary GitHub problem: open the deployment's **⋯** menu and choose **Redeploy**.
 
 ## Settings
 
@@ -142,6 +126,7 @@ The bot's log appears in Railway's **Deploy Logs**. The data files are on the vo
 | `WALLET_PRIVATE_KEY` | Yes | The private key of the bot's wallet. The address is worked out from it. Never printed or logged |
 | `MAX_TRADE_USD` | No | Upper limit on any single buy, in USD. Empty means no limit |
 | `DATA_DIR` | No | Where memory and logs are kept. Default: `./data`; on Railway, your volume path (`/data`) |
+| `AUTO_APPROVE` | No | `yes`: if the one-time approvals are missing, the bot sends them itself at start-up (for Railway). Default `no`: the Start Bot file asks you instead |
 | `TREND_CORE` | No | `on` (default): Trend Core + Range Harvester. `off`: Trend Bot + Range Harvester; any WBTC the Trend Core holds is sold at the next cycle |
 | `CANDLE_SOURCE` | No | `swaps` (default): candles from every trade in the pool. `samples`: from 20-minute price samples |
 | `COINGECKO_API_KEY` | No | Only for the one-time history warm-up, if CoinGecko refuses requests without a key |

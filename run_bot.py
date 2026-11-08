@@ -3,6 +3,10 @@ Start The Lifedao BTC Trading Bot.
 
     python run_bot.py
 
+(Or double-click "Start Bot (Windows).bat" / "Start Bot (Mac).command", which
+installs what's needed, asks for your key the first time and checks your
+wallet before starting this.)
+
 It trades WBTC/USDC on Uniswap V3 (Arbitrum One) with real money, fully
 automatically: every signal is executed immediately, with no approval step.
 Read README.md and DISCLAIMER.md before running it.
@@ -40,11 +44,11 @@ from bot.scheduler import run_forever
 from bot.settings import SettingsError, load_settings
 from bot.swap_candles import candle_source_with_retries
 from bot.trend_core_history import warm_trend_core, HistoryError
+from bot.easy_setup import (MIN_ETH_FOR_GAS, MIN_USDC_TO_TRADE, keep_awake, remember_wallet,
+                            wallet_mismatch)
 
 log = logging.getLogger("lifedao-bot")
 
-MIN_ETH_FOR_GAS = 0.0003       # a few hundred swaps' worth on Arbitrum
-MIN_USDC_TO_TRADE = 60.0       # the bot always keeps $50 in USDC
 BOOTSTRAP_ATTEMPTS = 10
 BOOTSTRAP_WAIT_SECONDS = 60
 
@@ -149,6 +153,21 @@ def warm_up_trend_core(orch: LiveOrchestrator) -> None:
              orch.tc.score())
 
 
+def status_line(orch: LiveOrchestrator, close: float) -> str:
+    """One plain line per cycle for the console."""
+    tc = orch.tc_status(close)
+    tb_val, rh_val = orch._position_value(close)
+    equity = orch.vault.balance + tb_val + rh_val
+    if not orch.trend_core_enabled:
+        core = "Trend Bot on (TREND_CORE=off)"
+    elif tc["ready"]:
+        core = f"Trend Core score {tc['score']:.1f}/20, holding ${tc['held']:,.2f} of ${tc['target']:,.2f} target"
+    else:
+        core = f"Trend Core warming up ({tc['candles']}/768)"
+    rh = "Range Harvester in a trade" if orch.rh.position else "Range Harvester waiting"
+    return f"BTC ${close:,.0f} | {core} | {rh} | USDC ${orch.vault.balance:,.2f} | total ${equity:,.2f}"
+
+
 def on_cycle_complete(orch: LiveOrchestrator, rec, store: LocalStore) -> None:
     store.append_cycle_log(rec)
     store.update_summary(build_summary(orch, rec.close))
@@ -157,6 +176,7 @@ def on_cycle_complete(orch: LiveOrchestrator, rec, store: LocalStore) -> None:
              rec.combined_equity)
     for action in rec.actions:
         log.info("  -> %s", action)
+    log.info("STATUS: %s", status_line(orch, rec.close))
 
 
 class LocalCandleStore:
@@ -179,9 +199,10 @@ class LocalCandleStore:
         self.store.save_partial_candle(builder_dict)
 
 
-def preflight(address: str) -> None:
+def preflight(address: str):
     """Read-only checks and a start-up summary. Warns; never stops the bot,
-    except for the pool check."""
+    except for the pool check. Returns whether both router approvals are in
+    place (None if that couldn't be checked)."""
     from bot.live_wallet import check_router_approvals, get_eth_balance
     log.info("Checking the pool on-chain...")
     try:
@@ -203,9 +224,11 @@ def preflight(address: str) -> None:
         log.info("Balances:  %.2f USDC, %.8f WBTC (~$%.2f), %.6f ETH for gas", usdc, wbtc, wbtc * price, eth)
         log.info("Approvals: USDC %s, WBTC %s", "OK" if a["usdc_ok"] else "MISSING", "OK" if a["wbtc_ok"] else "MISSING")
         log.info("=" * 70)
-        if not (a["usdc_ok"] and a["wbtc_ok"]) or not a["usdc_covers_balance"]:
-            log.warning("ROUTER APPROVAL MISSING OR LOW: buys and/or sells will fail until you run "
-                        "`python scripts/approve_tokens.py` (one-time, see README).")
+        approved = a["usdc_ok"] and a["wbtc_ok"] and a["usdc_covers_balance"]
+        if not approved:
+            log.warning("ROUTER APPROVAL MISSING OR LOW: buys and/or sells will fail until the one-time "
+                        "approvals are sent (the Start Bot file offers them, or set AUTO_APPROVE=yes, or run "
+                        "`python scripts/approve_tokens.py`).")
         if eth < MIN_ETH_FOR_GAS:
             log.warning("LOW ETH: %.6f ETH. Every trade pays a little gas in ETH on Arbitrum; add some ETH "
                         "(0.001 ETH is plenty) or trades will fail.", eth)
@@ -214,8 +237,39 @@ def preflight(address: str) -> None:
         if wbtc > 0:
             log.warning("This wallet already holds WBTC. The bot only manages positions it opened itself and "
                         "never sells WBTC it didn't buy. A dedicated wallet holding only USDC is best.")
+        return approved
     except Exception as e:  # noqa: BLE001 -- a pre-flight check must never crash start-up
         log.error("Could not complete the start-up checks (continuing): %s", e)
+        return None
+
+
+def auto_approve(settings) -> None:
+    """AUTO_APPROVE=yes: send the missing router approvals without asking
+    (each is simulated first and skipped if already unlimited)."""
+    from bot.approvals import approve_both
+    log.warning("AUTO_APPROVE=yes: sending the one-time router approvals (they move no tokens; a little ETH gas).")
+    try:
+        ok = approve_both(settings, confirm=lambda question: True)
+    except Exception as e:  # noqa: BLE001 -- the bot still starts; trades fail until approved
+        log.error("Automatic approval failed (continuing; trades will fail until approved): %s", e)
+        return
+    if ok:
+        log.info("Router approvals are in place.")
+    else:
+        log.error("The router approvals are still missing; trades will fail until they're sent.")
+
+
+def check_data_folder(settings) -> None:
+    """Refuse to use one wallet's memory with another wallet's key: it would
+    think it holds positions the new wallet doesn't have."""
+    other = wallet_mismatch(settings.data_dir, settings.wallet_address)
+    if other:
+        log.error("The data folder %s holds the memory of a different wallet (%s), but your key is for %s. "
+                  "Refusing to start. Put the right key back, or move that data folder somewhere else so "
+                  "this wallet starts fresh (the Start Bot file can do this for you).",
+                  settings.data_dir, other, settings.wallet_address)
+        sys.exit(1)
+    remember_wallet(settings.data_dir, settings.wallet_address)
 
 
 def main() -> None:
@@ -226,7 +280,10 @@ def main() -> None:
         sys.exit(1)
     setup_logging(settings.data_dir)
     log.info("The Lifedao BTC Trading Bot starting. Data folder: %s", settings.data_dir)
-    preflight(settings.wallet_address)
+    approved = preflight(settings.wallet_address)
+    check_data_folder(settings)
+    if approved is False and settings.auto_approve:
+        auto_approve(settings)
 
     store = LocalStore(settings.data_dir)
     state = store.load_state()
@@ -266,6 +323,10 @@ def main() -> None:
     if settings.max_trade_usd:
         orch.vault = CappedVault(settings.wallet_address, MAINNET, settings.max_trade_usd)
         log.info("MAX_TRADE_USD: no single buy will be larger than $%.2f.", settings.max_trade_usd)
+
+    awake = keep_awake()
+    if awake:
+        log.info("Keep-awake: %s. Close this window (or press Ctrl+C) to stop the bot.", awake)
 
     log.warning("=" * 70)
     log.warning("FULLY AUTOMATIC MODE: entries and exits execute for REAL, immediately, with NO")

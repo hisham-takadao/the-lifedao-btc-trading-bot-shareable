@@ -13,6 +13,9 @@ Optional settings (see .env.example):
   TREND_CORE       "on" (default): the Trend Core replaces the Trend Bot's
                    entries; "off": the Trend Bot trades instead, and any
                    WBTC the Trend Core holds is sold at the next cycle
+  AUTO_APPROVE     "yes": if the one-time router approvals are missing, the
+                   bot sends them itself at start-up (for Railway, where
+                   nobody can type YES). Default "no".
   COINGECKO_API_KEY  only used once, for the history warm-up on a fresh start
   WALLET_ADDRESS   optional; if set, must match the address of the key
 """
@@ -57,6 +60,7 @@ class Settings:
     candle_source: str
     coingecko_api_key: Optional[str]
     trend_core: bool = True
+    auto_approve: bool = False
 
     def __repr__(self) -> str:      # never show the key, even by accident
         return (f"Settings(wallet_address={self.wallet_address!r}, data_dir={str(self.data_dir)!r}, "
@@ -103,7 +107,11 @@ def load_settings(env_file: Optional[Path] = None) -> Settings:
     if tc not in ("on", "off"):
         raise SettingsError(f"TREND_CORE must be 'on' or 'off', got {tc!r}")
 
+    aa = os.environ.get("AUTO_APPROVE", "no").strip().lower() or "no"
+    if aa not in ("yes", "no"):
+        raise SettingsError(f"AUTO_APPROVE must be 'yes' or 'no', got {aa!r}")
+
     data_dir = Path(os.environ.get("DATA_DIR", "").strip() or ROOT / "data")
     return Settings(private_key=key, wallet_address=address, data_dir=data_dir, max_trade_usd=cap,
                     candle_source=source, coingecko_api_key=os.environ.get("COINGECKO_API_KEY") or None,
-                    trend_core=tc == "on")
+                    trend_core=tc == "on", auto_approve=aa == "yes")
