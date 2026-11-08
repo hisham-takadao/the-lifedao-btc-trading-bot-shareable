@@ -115,3 +115,60 @@ def test_warm_up_drops_the_unfinished_candle():
     cs = [Candle(w + i * 14400, 1, 1, 1, 1) for i in range(3)]
     assert [c.timestamp for c in run_bot.finished_candles(cs, w + 2 * 14400 + 3600)] == [w, w + 14400]
     assert len(run_bot.finished_candles(cs, w + 3 * 14400)) == 3
+
+
+def test_warm_up_retries_instead_of_exiting(monkeypatch):
+    """CoinGecko refusing (429) must not make the bot exit and be restarted in
+    a loop: it waits and retries in-process."""
+    from bot.bootstrap import BootstrapError
+    calls, waits = [], []
+
+    def flaky(api_key):
+        calls.append(api_key)
+        if len(calls) < 3:
+            raise BootstrapError("CoinGecko rate limit hit (429)")
+        return ["candles"]
+    monkeypatch.setattr(run_bot, "bootstrap_history", flaky)
+    assert run_bot.bootstrap_with_retries(None, attempts=5, wait=60, sleep=waits.append) == ["candles"]
+    assert len(calls) == 3 and waits == [60, 60]
+
+
+def test_warm_up_gives_up_after_the_last_attempt(monkeypatch):
+    import pytest
+    from bot.bootstrap import BootstrapError
+    monkeypatch.setattr(run_bot, "bootstrap_history", lambda k: (_ for _ in ()).throw(BootstrapError("429")))
+    with pytest.raises(BootstrapError):
+        run_bot.bootstrap_with_retries("key", attempts=3, wait=0, sleep=lambda s: None)
+
+
+def test_trend_core_setting(tmp_path, monkeypatch):
+    import pytest
+    from bot.settings import SettingsError, load_settings
+    from eth_account import Account
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", Account.create().key.hex())
+    monkeypatch.delenv("TREND_CORE", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    assert load_settings(env).trend_core is True
+    monkeypatch.setenv("TREND_CORE", "off")
+    assert load_settings(env).trend_core is False
+    monkeypatch.setenv("TREND_CORE", "maybe")
+    with pytest.raises(SettingsError):
+        load_settings(env)
+
+
+def test_summary_shows_the_trend_core_and_twap_guard(monkeypatch):
+    from bot import live_orchestrator
+    from bot.live_config import MAINNET
+
+    class Store:
+        def get_all_proposals(self): return []
+        def write_new_proposal(self, p): pass
+        def update_status_by_id(self, *a, **k): pass
+        def append_live_trade(self, p): pass
+    orch = live_orchestrator.LiveOrchestrator("0x" + "1" * 40, "", MAINNET, Store(), auto_execute=True,
+                                              trend_core=True)
+    orch.vault._cached_usdc_balance = 100.0
+    s = run_bot.build_summary(orch, 80_000.0)
+    assert s["Trend Core"] == "ON" and s["Trend Core ready?"].startswith("No (")
+    assert s["Trend Core WBTC"] == 0 and "30-minute" in s["TWAP guard"]

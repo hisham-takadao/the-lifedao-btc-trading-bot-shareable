@@ -23,13 +23,18 @@ def px(price):
     return price_from_sqrt_price_x96(sp(price))
 
 
+def tx(n):
+    """A made-up transaction hash."""
+    return "0x" + format(n, "064x")
+
+
 # ---------------------------------------------------------------------------
 # The candle itself
 # ---------------------------------------------------------------------------
 
-def test_candle_uses_last_swap_before_start_and_every_swap_inside():
-    before = [(100, 1, sp(80_000)), (101, 0, sp(80_100))]            # the later one is the open
-    inside = [(105, 2, sp(80_500)), (103, 0, sp(79_900)), (110, 0, sp(80_200))]
+def test_candle_uses_last_swap_before_start_and_every_transaction_inside():
+    before = [(100, 1, sp(80_000), tx(1)), (101, 0, sp(80_100), tx(2))]     # the later one is the open
+    inside = [(105, 2, sp(80_500), tx(3)), (103, 0, sp(79_900), tx(4)), (110, 0, sp(80_200), tx(5))]
     c = sc.build_candle(W, before, inside)
     assert c.timestamp == W
     assert c.open == px(80_100)
@@ -38,13 +43,42 @@ def test_candle_uses_last_swap_before_start_and_every_swap_inside():
 
 
 def test_window_without_swaps_keeps_the_standing_price():
-    c = sc.build_candle(W, [(100, 0, sp(80_000))], [])
+    c = sc.build_candle(W, [(100, 0, sp(80_000), tx(1))], [])
     assert (c.open, c.high, c.low, c.close) == (px(80_000),) * 4
 
 
 def test_no_swap_before_the_window_is_an_error():
     with pytest.raises(sc.OnchainError):
-        sc.build_candle(W, [], [(105, 0, sp(80_000))])
+        sc.build_candle(W, [], [(105, 0, sp(80_000), tx(1))])
+
+
+def test_dip_and_recover_inside_one_transaction_is_ignored():
+    """One transaction pushes the pool from ~$110,800 to $110 and back (as
+    0xef6923493d... did on 2025-10-20): only its final price counts."""
+    before = [(100, 0, sp(110_800), tx(1))]
+    inside = [(105, 3, sp(110_900), tx(2)),
+              (106, 17, sp(110.86), tx(9)), (106, 24, sp(110.26), tx(9)), (106, 30, sp(110_801), tx(9)),
+              (107, 0, sp(110_700), tx(3))]
+    c = sc.build_candle(W, before, inside)
+    assert c.low == px(110_700) and c.high == px(110_900)
+    assert c.close == px(110_700) and c.open == px(110_800)
+
+
+def test_a_transaction_ending_at_an_extreme_still_counts():
+    """The rule drops only prices *between* a transaction's swaps; a
+    transaction that leaves the pool at a new low sets the low."""
+    before = [(100, 0, sp(80_000), tx(1))]
+    inside = [(105, 0, sp(81_000), tx(2)), (105, 1, sp(79_000), tx(2)),     # dips, ends at 79,000
+              (106, 0, sp(85_000), tx(3)), (106, 4, sp(80_500), tx(3))]     # spikes, ends at 80,500
+    c = sc.build_candle(W, before, inside)
+    assert c.low == px(79_000) and c.high == px(80_500) and c.close == px(80_500)
+
+
+def test_last_swap_per_transaction_keeps_chain_order():
+    a, b = tx(7), tx(8)
+    swaps = [(106, 2, 3, b), (105, 9, 2, a), (105, 1, 1, a), (106, 5, 4, b.upper()), (107, 0, 5, a)]
+    # the same hash in another block is another transaction (can't happen on chain; keyed by block anyway)
+    assert sc.last_swap_per_transaction(swaps) == [(105, 9, 2, a), (106, 5, 4, b.upper()), (107, 0, 5, a)]
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +91,7 @@ class FakeChain:
     def __init__(self, swaps):
         self.t0, self.b0 = W - 6 * 3600, 1_000_000
         self.latest = self.b0 + 2 * (H4 + 6 * 3600 + 600)
-        self.swaps = swaps                       # {block: [price, ...]}
+        self.swaps = swaps                       # {block: [price or (price, tx_hash), ...]}
         self.calls = []
 
     def ts(self, b):
@@ -79,9 +113,10 @@ class FakeChain:
             for blk in sorted(self.swaps):
                 if a <= blk <= b:
                     for i, p in enumerate(self.swaps[blk]):
+                        p, h = p if isinstance(p, tuple) else (p, tx(blk * 1000 + i))   # default: own tx
                         data = "0x" + "0" * 128 + format(sp(p), "064x") + "0" * 128
                         out.append({"address": sc.config.POOL_ADDRESS.lower(), "blockNumber": hex(blk),
-                                    "logIndex": hex(i), "data": data})
+                                    "logIndex": hex(i), "data": data, "transactionHash": h})
             return out
         raise AssertionError(method)
 
@@ -93,12 +128,13 @@ def test_candle_for_window_from_the_chain(monkeypatch):
         ch.block_at(W) - 1: [80_050.0],          # last swap before the start (same second as W? no: W-1)
         ch.block_at(W): [80_060.0],              # in the start second: the open, and inside the window
         ch.block_at(W + 3600): [81_000.0, 79_500.0],
+        ch.block_at(W + 7200): [(80_100.0, tx(42)), (110.0, tx(42)), (80_200.0, tx(42))],   # dip inside one tx
         ch.block_at(W + H4) - 1: [80_400.0],     # last second of the window
         ch.block_at(W + H4): [99_999.0],         # the next window's first second: excluded
     }
     monkeypatch.setattr(sc, "_rpc", ch.rpc)
     c, n = sc.candle_for_window(W)
-    assert n == 4
+    assert n == 7
     assert c.open == px(80_060.0)
     assert c.high == px(81_000.0) and c.low == px(79_500.0)
     assert c.close == px(80_400.0)

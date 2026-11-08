@@ -6,9 +6,15 @@ An automatic trading bot that trades **WBTC/USDC on Uniswap V3 (Arbitrum One)** 
 
 ## What it does
 
-The bot runs two strategies, which share the wallet's USDC:
+The bot runs two strategies at a time, which share the wallet's USDC: the Trend Core (or, if you switch it off, the Trend Bot) and the Range Harvester.
 
-- **Trend Bot.** It buys when a strong uptrend is confirmed and the price is above its 20-candle average:
+- **Trend Core** (the default). It holds an amount of BTC that follows the strength of the trend, from nothing in a downtrend up to most of the account in a strong uptrend. It adjusts that amount every 4 hours.
+  - **Trend score (0–20):** built from 4 moving-average gaps (24/96 up to 192/768 candles) and 4 breakout measures (60 to 480 candles). Each is scaled to the same size, then they're averaged. A downtrend scores 0.
+  - **Size:** account value × score/10 × 25% ÷ BTC's annual volatility, and at most the account minus the $50 reserve. So it holds less when BTC is wild and more when it's calm.
+  - **Trades:** only when the gap to the target is more than 10% of a typical position and at least $10, which avoids constant small trades.
+  - It has no stop-loss of its own: it sells as the trend score falls. It needs 128 days of history, which it downloads from Binance's public price data on the first start.
+  - Based on Robert Carver's *Systematic Trading*. In the original project's tests on the pool's own trades (2023–2026), it gained much more than the Trend Bot in rising markets, lost more in sideways, falling and crash periods, and had deeper drops (about −24% at worst). Past results don't predict future ones.
+- **Trend Bot** (only with `TREND_CORE=off`). It buys when a strong uptrend is confirmed and the price is above its 20-candle average:
   - ADX above 42 and EMA20 above EMA50;
   - RSI between 45 and 75, MACD above its signal line, and volatility (ATR) at most 8%.
 
@@ -25,8 +31,13 @@ The bot runs two strategies, which share the wallet's USDC:
 Some rules apply to everything:
 - **Candles:** 4-hour candles (UTC), each built from every trade in the pool.
 - **Reserve:** **$50 always stays in USDC**.
-- **Circuit breaker:** stops a strategy for the day after losses of 7% of the day's opening value.
-- **Guards:** a trade is skipped if the price moved more than 1% since the decision, or if the swap would get more than 0.5% less than expected.
+- **Circuit breaker:** stops the Trend Bot or the Range Harvester for the day after losses of 7% of the day's opening value.
+- **Guards:** a trade is skipped if:
+  - the price moved more than 1% since the decision;
+  - the pool's price is more than 1% away from its own 30-minute average (TWAP), which protects against trading on a brief price spike;
+  - the swap would get more than 0.5% less than expected.
+
+  A skipped trade is re-checked at the next cycle. Each candle also counts only the final price of each transaction, so a price spike inside one transaction can't distort the indicators.
 
 ## What you need
 
@@ -97,7 +108,7 @@ Everything is in the `data` folder:
 | `cycle_log.csv` | One row per 4-hour cycle: price, market regime, USDC, position values, total equity, what happened |
 | `trades.csv` | Every executed swap, with its transaction hash (look it up on arbiscan.io) |
 | `proposals.csv` | Every signal and its outcome (executed, failed, skipped by a guard) |
-| `summary.json` | The latest overview |
+| `summary.json` | The latest overview, including the Trend Core's score, target and holding |
 | `bot.log` | The full log |
 | `state.json` | **The bot's memory.** Don't edit or delete it while positions are open, or the bot will forget them |
 
@@ -131,6 +142,7 @@ The bot's log appears in Railway's **Deploy Logs**. The data files are on the vo
 | `WALLET_PRIVATE_KEY` | Yes | The private key of the bot's wallet. The address is worked out from it. Never printed or logged |
 | `MAX_TRADE_USD` | No | Upper limit on any single buy, in USD. Empty means no limit |
 | `DATA_DIR` | No | Where memory and logs are kept. Default: `./data`; on Railway, your volume path (`/data`) |
+| `TREND_CORE` | No | `on` (default): Trend Core + Range Harvester. `off`: Trend Bot + Range Harvester; any WBTC the Trend Core holds is sold at the next cycle |
 | `CANDLE_SOURCE` | No | `swaps` (default): candles from every trade in the pool. `samples`: from 20-minute price samples |
 | `COINGECKO_API_KEY` | No | Only for the one-time history warm-up, if CoinGecko refuses requests without a key |
 | `WALLET_ADDRESS` | No | If set, must match the key's address (a safety check) |

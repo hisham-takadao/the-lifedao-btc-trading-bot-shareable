@@ -24,6 +24,13 @@ Phase order per cycle:
      way as the paper bot: temporarily debit the live vault's cached
      balance by TB's proposed size before sizing RH.
   7. Persist state.
+
+Strategy v4 (2026-11-08): with trend_core=True the Trend Core
+(bot/trend_core.py) replaces the Trend Bot's entries. After the Range
+Harvester has acted, the Trend Core moves its own BTC holding towards its
+target. Its trades are logged as EXECUTED/FAILED/EXPIRED_STALE rows with
+engine "TC" (never PENDING/APPROVED: they're never approved by hand). Its
+BTC is counted in the "TB" value columns of the cycle log.
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ from .live_proposals import (
     STATUS_EXPIRED_STALE,
 )
 from .live_execution import execute_buy, execute_sell, StalePriceError, ExecutionRevertedError
+from .trend_core import TrendCore, MIN_TRADE_USD as TC_MIN_TRADE_USD, WARMUP as TC_WARMUP
 
 log = logging.getLogger("lifedao-bot.live_orchestrator")
 
@@ -72,7 +80,7 @@ class LiveCycleRecord:
 
 class LiveOrchestrator:
     def __init__(self, wallet_address: str, private_key: str, network: NetworkConfig,
-                 proposal_sheet: ProposalStore, auto_execute: bool = False):
+                 proposal_sheet: ProposalStore, auto_execute: bool = False, trend_core: bool = False):
         self.wallet_address = wallet_address
         self.private_key = private_key
         self.network = network
@@ -92,6 +100,14 @@ class LiveOrchestrator:
         self.warmup_done = False
         self.current_regime = config.REGIME_RANGING
 
+        # Strategy v4: the Trend Core. Its indicator state is fed every candle
+        # either way; it trades only when enabled (or, when disabled, to sell
+        # off a holding it still has).
+        self.trend_core_enabled = trend_core
+        self.tc = TrendCore()
+        self.tc_wbtc_qty = 0.0       # WBTC bought by the Trend Core and not yet sold
+        self.tc_cost_usd = 0.0       # USDC paid for that WBTC (for realised P&L)
+
     # -----------------------------------------------------------------
     def replay_candle_indicators_only(self, candle: Candle) -> None:
         """Used only when restoring state after a restart -- see
@@ -104,10 +120,13 @@ class LiveOrchestrator:
         self.rh.update_violator_tracker(self.candle_index, candle.close, snap.bb_lower, snap.rsi)
         self.warmup_done = self.indicators.n_candles_seen >= config.WARMUP_CANDLES
         self.candle_history.append(candle)
+        self.tc.update(candle.high, candle.low, candle.close, candle.timestamp)
 
     # -----------------------------------------------------------------
     def _position_value(self, current_close: float) -> tuple[float, float]:
-        tb_value = sum(p.wbtc_qty * current_close for p in self.tb.positions)
+        """(TB + Trend Core value, RH value). The Trend Core replaces the Trend
+        Bot, so its BTC is reported in the TB columns."""
+        tb_value = sum(p.wbtc_qty * current_close for p in self.tb.positions) + self.tc_wbtc_qty * current_close
         rh_value = self.rh.position.wbtc_qty * current_close if self.rh.position else 0.0
         return tb_value, rh_value
 
@@ -161,6 +180,7 @@ class LiveOrchestrator:
 
         # ---- Indicators + regime ----
         snap = self.indicators.update(candle)
+        self.tc.update(candle.high, candle.low, candle.close, candle.timestamp)
         regime_state = self.regime_clf.update(snap)
         regime = regime_state.regime
         self.current_regime = regime
@@ -195,7 +215,7 @@ class LiveOrchestrator:
         combined_equity_now = self.vault.balance + tb_val_now + rh_val_now
 
         tb_entry_fill = None
-        if not has_open_entry_in_list(all_proposals, "TB"):
+        if not self.trend_core_enabled and not has_open_entry_in_list(all_proposals, "TB"):
             tb_entry_fill = self.tb.check_entry(idx, snap, regime, candle.close, combined_equity_now,
                                                  self.vault, self.warmup_done)
 
@@ -245,13 +265,20 @@ class LiveOrchestrator:
                     log.warning("Post-trade USDC balance refresh failed; cycle log shows the pre-trade balance: %s", e)
                     actions.append("USDC balance not re-read after trading -- Vault USDC/equity in this row are pre-trade")
 
+        # ---- Strategy v4: the Trend Core acts after the Range Harvester ----
+        if self.trend_core_enabled or self.tc_wbtc_qty > 0:
+            if self.auto_execute:
+                self._rebalance_trend_core(candle, actions)
+            else:
+                actions.append("Trend Core needs AUTO_EXECUTE=true to trade; it did nothing")
+
         tb_val_final, rh_val_final = self._position_value(candle.close)
         return LiveCycleRecord(
             candle_index=idx, timestamp=candle.timestamp, close=candle.close,
             regime_label=config.REGIME_LABELS[regime],
             vault_usdc=self.vault.balance, tb_position_value=tb_val_final, rh_position_value=rh_val_final,
             combined_equity=self.vault.balance + tb_val_final + rh_val_final,
-            tb_open_positions=len(self.tb.positions), rh_open_position=self.rh.position is not None,
+            tb_open_positions=len(self.tb.positions) + (1 if self.tc_wbtc_qty > 0 else 0), rh_open_position=self.rh.position is not None,
             warmup_done=self.warmup_done, actions=actions,
         )
 
@@ -291,6 +318,13 @@ class LiveOrchestrator:
         ordered = sorted(actionable, key=lambda p: order_key.get((p.engine, p.side), 99))
 
         for proposal in ordered:
+            if proposal.engine not in ("TB", "RH"):
+                # Trend Core rows are written already resolved; one edited by hand must not trade.
+                self.proposals.update_status_by_id(proposal.proposal_id, STATUS_FAILED,
+                                                    Error="Only TB/RH proposals can be approved by hand")
+                actions.append(f"Proposal {proposal.proposal_id} ({proposal.engine}) ignored: "
+                               f"Trend Core trades aren't approved by hand")
+                continue
             if proposal.status == STATUS_REJECTED:
                 self._handle_rejection(proposal)
                 actions.append(f"Proposal {proposal.proposal_id} ({proposal.engine} {proposal.side}) was rejected -- reverted to active monitoring")
@@ -427,3 +461,95 @@ class LiveOrchestrator:
         self.proposals.append_live_trade(proposal)
         actions.append(f"SELL executed: {engine_name} sold {position.wbtc_qty:.8f} WBTC "
                         f"@ ${fill_result.fill_price:,.2f} (tx {fill_result.tx_hash}), net P&L ${net_pnl:,.2f}")
+
+    # -----------------------------------------------------------------
+    def tc_status(self, close: float) -> dict:
+        """The Trend Core's current numbers, for the cycle notes and the summary."""
+        tb_val, rh_val = self._position_value(close)
+        equity = self.vault.balance + tb_val + rh_val
+        held = self.tc_wbtc_qty * close
+        return {"ready": self.tc.ready, "candles": self.tc.n, "score": self.tc.score(),
+                "target": self.tc.target_usd(equity) if self.trend_core_enabled else 0.0,
+                "held": held, "equity": equity}
+
+    def _rebalance_trend_core(self, candle: Candle, actions: list[str]) -> None:
+        """Move the Trend Core's holding towards its target (identical rules to
+        the backtest's TrendCoreRun.rebalance). Disabled with a holding left:
+        target 0, sell it all."""
+        close = candle.close
+        if self.trend_core_enabled and not self.tc.ready:
+            actions.append(f"Trend Core warming up ({self.tc.n}/{TC_WARMUP} candles); no trade")
+            return
+        st = self.tc_status(close)
+        equity, held, target = st["equity"], st["held"], st["target"]
+        gap = target - held
+        info = f"Trend Core: score {st['score']:.1f}/20, target ${target:,.2f}, holding ${held:,.2f}"
+        rollback = not self.trend_core_enabled
+        if not rollback and (abs(gap) <= self.tc.buffer_usd(equity) or abs(gap) < TC_MIN_TRADE_USD):
+            actions.append(info + " -- no trade (within the buffer)")
+            return
+        side = "BUY" if gap > 0 else "SELL"
+        size, qty, sell_all = 0.0, 0.0, False
+        if side == "BUY":
+            size = self.vault.max_affordable_size(gap)
+            if size < TC_MIN_TRADE_USD:
+                actions.append(info + f" -- no trade (only ${size:,.2f} USDC free above the reserve)")
+                return
+        else:
+            sell_all = rollback or target <= 0
+            qty = self.tc_wbtc_qty if sell_all else min(self.tc_wbtc_qty, -gap / close)
+            if qty <= 0:
+                return
+        p = Proposal(proposal_id=new_proposal_id(), created_at=candle.timestamp, engine="TC", side=side,
+                     size_usd=size, position_id="TC", reason="ROLLBACK" if rollback else "REBALANCE",
+                     price_at_proposal=close, notes=info,
+                     meta={"score": round(st["score"], 3), "target_usd": round(target, 2), "held_usd": round(held, 2)})
+        try:
+            if side == "BUY":
+                fill = execute_buy(self.network, self.private_key, self.wallet_address, size, close)
+                self.tc_wbtc_qty += fill.wbtc_qty
+                self.tc_cost_usd += fill.usd_value
+                msg = f"TC BUY executed: {fill.wbtc_qty:.8f} WBTC for ${fill.usd_value:,.2f} @ ${fill.fill_price:,.2f}"
+            else:
+                before = self.tc_wbtc_qty
+                # +0.1 satoshi: the amount is truncated to whole satoshis, and float rounding could drop one
+                fill = execute_sell(self.network, self.private_key, self.wallet_address,
+                                    (round(qty * 1e8) + 0.1) / 1e8, close)
+                frac = min(1.0, fill.wbtc_qty / before) if before > 0 else 1.0
+                pnl = fill.usd_value - self.tc_cost_usd * frac
+                if sell_all or before - fill.wbtc_qty < 1e-8:
+                    self.tc_wbtc_qty, self.tc_cost_usd = 0.0, 0.0
+                else:
+                    self.tc_wbtc_qty = before - fill.wbtc_qty
+                    self.tc_cost_usd *= (1 - frac)
+                msg = (f"TC SELL executed: {fill.wbtc_qty:.8f} WBTC for ${fill.usd_value:,.2f} @ "
+                       f"${fill.fill_price:,.2f}, realised P&L ${pnl:,.2f}")
+        except StalePriceError as e:     # includes the TWAP guard
+            p.status, p.error = STATUS_EXPIRED_STALE, str(e)
+            actions.append(info + f" -- {side} skipped: {e}")
+            self._log_tc_row(p, executed=False)
+            return
+        except Exception as e:   # noqa: BLE001 -- recorded, retried next cycle
+            p.status, p.error = STATUS_FAILED, str(e)
+            actions.append(info + f" -- {side} failed: {e}")
+            self._log_tc_row(p, executed=False)
+            return
+        p.status, p.tx_hash, p.actual_fill_price = STATUS_EXECUTED, fill.tx_hash, fill.fill_price
+        p.actual_amount, p.executed_at = (fill.wbtc_qty if side == "BUY" else fill.usd_value), candle.timestamp
+        actions.append(info + f" -- {msg} (tx {fill.tx_hash})")
+        self._log_tc_row(p, executed=True)
+        try:
+            self.vault.refresh_balance()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Post-trade USDC balance refresh failed after a Trend Core trade: %s", e)
+
+    def _log_tc_row(self, p: Proposal, executed: bool) -> None:
+        """Write the Trend Core's row (and Live Trades row). A storage error must
+        never lose a real trade: the holding is already updated in memory and
+        is saved with the state at the end of the cycle."""
+        try:
+            self.proposals.write_new_proposal(p)
+            if executed:
+                self.proposals.append_live_trade(p)
+        except Exception as e:  # noqa: BLE001
+            log.error("Couldn't write the Trend Core %s row to the proposals file (trade state is kept): %s", p.side, e)

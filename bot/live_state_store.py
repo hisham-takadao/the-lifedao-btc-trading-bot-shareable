@@ -28,6 +28,7 @@ from .portfolio import TBPosition, RHPosition
 from .live_orchestrator import LiveOrchestrator
 from .live_config import NetworkConfig
 from .live_proposals import ProposalStore
+from .trend_core import TrendCore
 
 
 def _candle_to_dict(c: Candle) -> dict:
@@ -58,13 +59,18 @@ def serialize_live_state(orch: LiveOrchestrator) -> dict:
         "rh_violator_history": [list(t) for t in orch.rh.violator_tracker.history],
 
         "candle_history": [_candle_to_dict(c) for c in orch.candle_history],
+
+        # Strategy v4: the Trend Core's own indicator state (it needs 768
+        # candles, more than candle_history keeps) and the WBTC it holds.
+        "tc": {"state": orch.tc.to_dict(), "wbtc_qty": orch.tc_wbtc_qty, "cost_usd": orch.tc_cost_usd},
     }
 
 
 def restore_live_state(state: dict, wallet_address: str, private_key: str,
                         network: NetworkConfig, proposal_sheet: ProposalStore,
-                        auto_execute: bool = False) -> LiveOrchestrator:
-    orch = LiveOrchestrator(wallet_address, private_key, network, proposal_sheet, auto_execute=auto_execute)
+                        auto_execute: bool = False, trend_core: bool = False) -> LiveOrchestrator:
+    orch = LiveOrchestrator(wallet_address, private_key, network, proposal_sheet, auto_execute=auto_execute,
+                            trend_core=trend_core)
 
     for cd in state["candle_history"]:
         orch.replay_candle_indicators_only(_dict_to_candle(cd))
@@ -84,5 +90,14 @@ def restore_live_state(state: dict, wallet_address: str, private_key: str,
     orch.rh.cooldown_until_candle_index = state["rh_cooldown_until_candle_index"]
     for entry in state["rh_violator_history"]:
         orch.rh.violator_tracker.history.append(tuple(entry))
+
+    # Saved before strategy v4: no "tc" key. The replay above fed the Trend
+    # Core from candle_history only (fewer than its 768 candles); live_main
+    # warms it up from longer history. Its holding is 0, which is right.
+    tc = state.get("tc")
+    if tc:
+        orch.tc = TrendCore.from_dict(tc["state"])
+        orch.tc_wbtc_qty = tc["wbtc_qty"]
+        orch.tc_cost_usd = tc["cost_usd"]
 
     return orch

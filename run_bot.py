@@ -13,8 +13,9 @@ On start-up it:
   2. checks the pool on-chain, your balances (USDC, WBTC, ETH for gas) and
      the router approvals, and prints a summary;
   3. resumes from its saved memory (data/state.json) or, on a first start,
-     warms up its indicators from about 70 days of price history (no trades
-     come from the warm-up);
+     warms up its indicators from about 70 days of price history, and the
+     Trend Core's from 128+ days of public Binance (or Kraken) 4-hour candles
+     (no trades come from the warm-up);
   4. then polls the price every 20 minutes and runs a trading cycle every
      4 hours (00, 04, 08, 12, 16, 20 UTC).
 """
@@ -27,7 +28,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from bot.live_config import MAINNET, LIVE_SLIPPAGE_TOLERANCE_PCT, MAX_PRICE_STALENESS_PCT
+from bot.live_config import (MAINNET, LIVE_SLIPPAGE_TOLERANCE_PCT, MAX_PRICE_STALENESS_PCT,
+                             MAX_TWAP_DEVIATION_PCT, TWAP_WINDOW_SECONDS)
 from bot.live_orchestrator import LiveOrchestrator
 from bot.live_portfolio import LiveVault
 from bot.live_state_store import serialize_live_state, restore_live_state
@@ -37,11 +39,32 @@ from bot.bootstrap import bootstrap_history, BootstrapError
 from bot.scheduler import run_forever
 from bot.settings import SettingsError, load_settings
 from bot.swap_candles import candle_source_with_retries
+from bot.trend_core_history import warm_trend_core, HistoryError
 
 log = logging.getLogger("lifedao-bot")
 
 MIN_ETH_FOR_GAS = 0.0003       # a few hundred swaps' worth on Arbitrum
 MIN_USDC_TO_TRADE = 60.0       # the bot always keeps $50 in USDC
+BOOTSTRAP_ATTEMPTS = 10
+BOOTSTRAP_WAIT_SECONDS = 60
+
+
+def bootstrap_with_retries(api_key, attempts: int = BOOTSTRAP_ATTEMPTS, wait: float = BOOTSTRAP_WAIT_SECONDS,
+                           sleep=time.sleep) -> list:
+    """The CoinGecko warm-up, retried in-process. CoinGecko's free API often
+    refuses (429) requests from shared cloud addresses; exiting instead makes
+    a host like Railway restart the bot every few seconds. Raises after the
+    last attempt."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return bootstrap_history(api_key)
+        except BootstrapError as e:
+            if attempt == attempts:
+                raise
+            log.warning("History warm-up attempt %d/%d failed (%s); trying again in %ds%s",
+                        attempt, attempts, e, wait,
+                        "" if api_key else " (setting COINGECKO_API_KEY, a free CoinGecko demo key, usually avoids this)")
+            sleep(wait)
 
 
 def finished_candles(candles, now_ts: int) -> list:
@@ -79,8 +102,9 @@ def setup_logging(data_dir) -> None:
 
 
 def build_summary(orch: LiveOrchestrator, last_price: float) -> dict:
-    tb_val, rh_val = orch._position_value(last_price)
+    tb_val, rh_val = orch._position_value(last_price)   # tb_val includes the Trend Core's holding
     equity = orch.vault.balance + tb_val + rh_val
+    tc = orch.tc_status(last_price)
     return {
         "Last updated (UTC)": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "Mode": "FULLY AUTOMATIC -- entries and exits execute immediately, no approval step",
@@ -93,9 +117,36 @@ def build_summary(orch: LiveOrchestrator, last_price: float) -> dict:
         "TB open positions": len(orch.tb.positions),
         "RH open position?": "Yes" if orch.rh.position else "No",
         "Combined equity ($)": round(equity, 2),
+        "Trend Core": ("ON" if orch.trend_core_enabled else
+                       ("OFF -- selling its remaining WBTC" if orch.tc_wbtc_qty > 0 else "OFF")),
+        "Trend Core ready?": "Yes" if tc["ready"] else f"No ({tc['candles']}/768 candles)",
+        "Trend Core score (0-20)": round(tc["score"], 2),
+        "Trend Core target ($)": round(tc["target"], 2),
+        "Trend Core WBTC": round(orch.tc_wbtc_qty, 8),
+        "Trend Core holding ($)": round(tc["held"], 2),
         "Slippage tolerance (%)": LIVE_SLIPPAGE_TOLERANCE_PCT,
         "Price staleness limit (%)": MAX_PRICE_STALENESS_PCT,
+        "TWAP guard": (f"skip any trade if the pool price is over {MAX_TWAP_DEVIATION_PCT}% from its "
+                       f"{TWAP_WINDOW_SECONDS // 60}-minute average"),
     }
+
+
+def warm_up_trend_core(orch: LiveOrchestrator) -> None:
+    """Feed the Trend Core 128+ days of public history if it isn't ready
+    (first start, or memory saved by an older version). Never stops the bot."""
+    if orch.tc.ready or not orch.candle_history:
+        return
+    last_ts = orch.candle_history[-1].timestamp
+    try:
+        tc, source = warm_trend_core(last_ts)
+    except HistoryError as e:
+        log.warning("Trend Core warm-up history unavailable (%s); it will get ready from live candles "
+                    "(%d/768 so far) and won't trade until then.", e, orch.tc.n)
+        return
+    if tc.n >= orch.tc.n:
+        orch.tc = tc
+    log.info("Trend Core: %d candles from %s; ready: %s; score now %.2f/20.", orch.tc.n, source, orch.tc.ready,
+             orch.tc.score())
 
 
 def on_cycle_complete(orch: LiveOrchestrator, rec, store: LocalStore) -> None:
@@ -182,22 +233,35 @@ def main() -> None:
     if state:
         log.info("Found saved memory (candle %d) -- resuming.", state["candle_index"])
         orch = restore_live_state(state, settings.wallet_address, settings.private_key, MAINNET, store,
-                                  auto_execute=True)
+                                  auto_execute=True, trend_core=settings.trend_core)
     else:
         log.info("No saved memory -- first start. Warming up the indicators from price history "
                  "(no trades come from this)...")
         try:
-            candles = bootstrap_history(settings.coingecko_api_key)
+            candles = bootstrap_with_retries(settings.coingecko_api_key)
         except BootstrapError as e:
             log.error("History warm-up failed: %s. Try again in a minute, or set COINGECKO_API_KEY "
                       "(a free key from coingecko.com).", e)
             sys.exit(1)
         candles = finished_candles(candles, int(time.time()))
-        orch = LiveOrchestrator(settings.wallet_address, settings.private_key, MAINNET, store, auto_execute=True)
+        orch = LiveOrchestrator(settings.wallet_address, settings.private_key, MAINNET, store, auto_execute=True,
+                                trend_core=settings.trend_core)
         for c in candles:
             orch.replay_candle_indicators_only(c)
         log.info("Warm-up complete: %d historical candles (ready to trade: %s).", len(candles), orch.warmup_done)
         store.save_state(serialize_live_state(orch))
+
+    if settings.trend_core:
+        log.info("Strategy: Trend Core + Range Harvester (the Trend Core replaces the Trend Bot's entries). "
+                 "Set TREND_CORE=off to use the Trend Bot instead.")
+        if not orch.tc.ready:
+            warm_up_trend_core(orch)
+            store.save_state(serialize_live_state(orch))
+    else:
+        log.info("TREND_CORE=off: the Trend Bot and Range Harvester trade%s.",
+                 "; the Trend Core's remaining WBTC is sold at the next cycle" if orch.tc_wbtc_qty > 0 else "")
+    log.info("TWAP guard: any trade is skipped if the pool price is more than %.1f%% from its %d-minute average.",
+             MAX_TWAP_DEVIATION_PCT, TWAP_WINDOW_SECONDS // 60)
 
     if settings.max_trade_usd:
         orch.vault = CappedVault(settings.wallet_address, MAINNET, settings.max_trade_usd)
