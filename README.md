@@ -102,6 +102,19 @@ The `.csv` files open in Excel or Google Sheets.
 
 Railway keeps the bot running around the clock, about $5 a month. Your key stays in your own Railway account.
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/G59rx7?referralCode=o_9ppa)
+
+1. **Click the button above** and sign in to Railway (or create an account).
+2. **Paste your wallet's private key** when Railway asks for `WALLET_PRIVATE_KEY`. Everything else is already set: the storage volume, `DATA_DIR=/data`, `AUTO_APPROVE=yes` (the bot sends the one-time approvals itself on its first start) and `TREND_CORE=on`.
+3. **Click Deploy.** After a few minutes, open the service, then **Deployments**, then **View logs**. You should see the start-up summary with your wallet's address and balances, then "Router approvals are in place", then "Trend Core: … ready: True".
+
+Make sure the wallet already holds USDC (at least $60) and a little ETH for gas on Arbitrum One before you deploy.
+
+**Never deploy a second copy for the same wallet,** and don't run it on your computer at the same time: two bots on one wallet would each think they own the money.
+
+### Setting it up by hand instead
+If you've changed the code, deploy your own copy instead of the button:
+
 1. **Get your own copy of this project on GitHub:** click **Fork** at the top of this page.
 2. **Create the service:**
    1. Sign in at railway.app.
