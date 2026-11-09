@@ -1,5 +1,7 @@
 # Making the "Deploy on Railway" button (for the maintainer, once)
 
+**Done on 2026-11-09:** the template is https://railway.com/deploy/G59rx7 and the README links to it. These notes are for rebuilding it.
+
 A Railway template turns the Railway setup into: click the button, sign in, paste a private key. Templates are created in a Railway account, so the maintainer makes it once. Nobody else's keys ever reach the maintainer: each person's deploy runs in their own Railway account.
 
 1. Sign in at railway.app. Open your workspace's **Templates** page (Workspace settings → Templates) and click **New Template**.
