@@ -18,10 +18,18 @@ model:
     amountIn=$20 means exactly $20 leaves the USDC balance -- nothing more.
 So the only real constraint on USDC sizing is the floor itself: don't
 size a trade that would leave the wallet below MIN_VAULT_BALANCE.
+
+With the real Savings Vault attached (bot/savings_vault.py, 2026-11-10),
+`balance` is ALL the bot's dollars: the wallet's USDC, any USDT a vault
+withdrawal paid out, and the value of its vault shares. So equity, profit
+and the Trend Core's target don't shrink when idle USDC is deposited.
+Sizing (`max_affordable_size`) counts only the part of the vault that can be
+withdrawn right now within its limits; `wallet_cash` is what's in the wallet.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -30,6 +38,8 @@ from .live_config import NetworkConfig
 from .live_wallet import (
     encode_erc20_balance_of_call, simulate_call, get_eth_balance, LiveWalletError,
 )
+
+log = logging.getLogger("lifedao-bot.live_portfolio")
 
 
 @dataclass
@@ -46,6 +56,7 @@ class LiveVault:
         self.network = network
         self.min_vault_balance = min_vault_balance
         self._cached_usdc_balance: Optional[float] = None
+        self.savings = None    # bot.savings_vault.SavingsVault when the Savings Vault feature is attached
 
     def refresh_balance(self) -> float:
         """Fetch the real, current USDC balance from chain. Must be called
@@ -57,13 +68,39 @@ class LiveVault:
             "big",
         )
         self._cached_usdc_balance = raw / 10 ** self.network.usdc_decimals
+        if self.savings is not None:
+            try:
+                self.savings.refresh_light()
+            except Exception as e:  # noqa: BLE001 -- keep the last known vault figures
+                log.warning("Couldn't read the Savings Vault balance (using the last known one): %s", e)
         return self._cached_usdc_balance
 
     @property
-    def balance(self) -> float:
+    def wallet_usdc(self) -> float:
         if self._cached_usdc_balance is None:
             raise LiveWalletError("LiveVault.balance read before refresh_balance() was called")
         return self._cached_usdc_balance
+
+    @property
+    def wallet_cash(self) -> float:
+        """USDC plus any USDT (from a vault withdrawal) in the wallet."""
+        return self.wallet_usdc + (self.savings.wallet_usdt_usd if self.savings is not None else 0.0)
+
+    @property
+    def savings_value(self) -> float:
+        return self.savings.value_usd if self.savings is not None else 0.0
+
+    @property
+    def savings_locked(self) -> float:
+        """Vault money a trade can't count on this cycle (paused, limits, mode)."""
+        if self.savings is None:
+            return 0.0
+        return max(0.0, self.savings.value_usd - self.savings.spendable_usd)
+
+    @property
+    def balance(self) -> float:
+        """All the bot's dollars: wallet cash plus the Savings Vault."""
+        return self.wallet_cash + self.savings_value
 
     def max_affordable_size(self, requested_usd: float) -> float:
         """Same signature and same job as the paper Vault's method (so TB/RH's
@@ -73,7 +110,7 @@ class LiveVault:
         extra USDC deduction. See module docstring."""
         if requested_usd <= 0:
             return 0.0
-        headroom = self.balance - self.min_vault_balance
+        headroom = self.balance - self.savings_locked - self.min_vault_balance
         if headroom <= 0:
             return 0.0
         return max(0.0, min(requested_usd, headroom))

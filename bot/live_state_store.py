@@ -63,6 +63,10 @@ def serialize_live_state(orch: LiveOrchestrator) -> dict:
         # Strategy v4: the Trend Core's own indicator state (it needs 768
         # candles, more than candle_history keeps) and the WBTC it holds.
         "tc": {"state": orch.tc.to_dict(), "wbtc_qty": orch.tc_wbtc_qty, "cost_usd": orch.tc_cost_usd},
+
+        # The real Savings Vault's books (deposited, withdrawn, gas, any
+        # unconfirmed transaction). Kept even while the feature isn't attached.
+        "savings": orch.savings.to_state() if orch.savings is not None else orch.savings_saved_state,
     }
 
 
@@ -99,5 +103,8 @@ def restore_live_state(state: dict, wallet_address: str, private_key: str,
         orch.tc = TrendCore.from_dict(tc["state"])
         orch.tc_wbtc_qty = tc["wbtc_qty"]
         orch.tc_cost_usd = tc["cost_usd"]
+
+    # Saved before the Savings Vault feature: no "savings" key (None).
+    orch.savings_saved_state = state.get("savings")
 
     return orch

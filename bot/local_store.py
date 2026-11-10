@@ -10,6 +10,11 @@ Local-file storage for everything the bot records, in DATA_DIR (default
   proposals.csv       every signal and what happened to it
   trades.csv          every executed swap (with its transaction hash)
   cycle_log.csv       one row per 4-hour cycle: price, regime, balances, equity
+                      (the last two columns, "Savings Vault ($)" and "Savings
+                      Yield ($)", were added with the optional Savings Vault;
+                      rows written before that simply don't have them)
+  savings_log.csv     only if the optional Savings Vault is used: every
+                      deposit, withdrawal, USDT swap and alert
   summary.json        the latest overview, rewritten each cycle
   bot.log             the bot's log (written by run_bot.py)
 
@@ -29,7 +34,8 @@ from pathlib import Path
 from typing import Optional
 
 from .live_proposals import (
-    LIVE_CYCLE_LOG_HEADERS, LIVE_TRADES_HEADERS, PENDING_TRADES_HEADERS, Proposal, proposal_to_row,
+    LIVE_CYCLE_LOG_HEADERS, LIVE_TRADES_HEADERS, PENDING_TRADES_HEADERS, SAVINGS_LOG_HEADERS, Proposal,
+    proposal_to_row,
     row_to_proposal,
 )
 
@@ -59,11 +65,23 @@ class LocalStore:
         self.state_path = self.dir / "state.json"
         self.partial_path = self.dir / "partial_candle.json"
         self.summary_path = self.dir / "summary.json"
+        self.savings_log_path = self.dir / "savings_log.csv"
         for path, headers in ((self.proposals_path, PENDING_TRADES_HEADERS),
                               (self.trades_path, LIVE_TRADES_HEADERS),
                               (self.cycle_log_path, LIVE_CYCLE_LOG_HEADERS)):
             if not path.exists():
                 _atomic_write(path, self._csv_text([headers]))
+        self._upgrade_cycle_log_header()
+
+    def _upgrade_cycle_log_header(self) -> None:
+        """A cycle_log.csv from an older version has the shorter header: add
+        the new column names to its first line once. Existing rows are left
+        exactly as they were (they just have no value in the new columns)."""
+        text = self.cycle_log_path.read_text(encoding="utf-8")
+        first, _, rest = text.partition(chr(10))
+        old = next(csv.reader([first.rstrip(chr(13))]), [])
+        if old != LIVE_CYCLE_LOG_HEADERS and old == LIVE_CYCLE_LOG_HEADERS[:len(old)]:
+            _atomic_write(self.cycle_log_path, self._csv_text([LIVE_CYCLE_LOG_HEADERS]) + rest)
 
     @staticmethod
     def _csv_text(rows: list[list]) -> str:
@@ -115,7 +133,15 @@ class LocalStore:
             _ts(rec.timestamp), rec.candle_index, rec.regime_label, round(rec.close, 2),
             round(rec.vault_usdc, 2), round(rec.tb_position_value, 2), rec.tb_open_positions,
             round(rec.rh_position_value, 2), "Yes" if rec.rh_open_position else "No",
-            round(rec.combined_equity, 2), "; ".join(rec.actions) if rec.actions else ""])
+            round(rec.combined_equity, 2), "; ".join(rec.actions) if rec.actions else "",
+            round(getattr(rec, "savings_value", 0.0), 2), round(getattr(rec, "savings_yield", 0.0), 4)])
+
+    def append_savings_log(self, rows: list[dict]) -> None:
+        """Rows from the optional Savings Vault (bot/savings_vault.py)."""
+        if not self.savings_log_path.exists():
+            _atomic_write(self.savings_log_path, self._csv_text([SAVINGS_LOG_HEADERS]))
+        for r in rows:
+            self._append(self.savings_log_path, [r.get(h, "") for h in SAVINGS_LOG_HEADERS])
 
     def update_summary(self, summary: dict) -> None:
         _atomic_write(self.summary_path, json.dumps(summary, indent=2))
