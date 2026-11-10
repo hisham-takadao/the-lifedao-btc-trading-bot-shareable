@@ -16,8 +16,8 @@ What the contract does (read from its verified source, SFVault.sol, and the
 circuit breaker SFAndIFCircuitBreaker.sol; implementation
 0x085ED6685Fd12507F7605E226DfEE996753397Ed behind the proxy below):
   - deposit(uint256 assets, address receiver): an ERC-4626 deposit of USDC.
-    Only registered members may receive shares (our wallet is one: maxDeposit
-    is non-zero for it). Needs a USDC allowance for the vault. No fees today
+    Only registered members may receive shares (maxDeposit is 0 for anyone
+    else). Needs a USDC allowance for the vault. No fees today
     (management and performance fee 0); a $1,000,000 total cap.
   - withdraw(uint256 assets, address receiver, address owner): burns shares
     for `assets` of USDC-equivalent value, paid from the vault's idle USDC,
