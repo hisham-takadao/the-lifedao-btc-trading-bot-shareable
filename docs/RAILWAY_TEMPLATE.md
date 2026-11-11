@@ -18,6 +18,8 @@ A Railway template turns the Railway setup into: click the button, sign in, past
      | `TREND_CORE` | `on` | |
      | `MAX_TRADE_USD` | *(empty)* | Optional. Description: "Upper limit on any single buy, in USD. Empty = no limit." |
 
+     Don't add the `SAVINGS_*` variables to the template: the Savings Vault is off by default and only works for wallets the vault's developers have registered. Anyone who has one can add `SAVINGS_VAULT_MODE` to their own service.
+
    - Start command, restart policy and the no-overlap setting come from `railway.json`; there's nothing to set.
 4. Click **Create Template**. If you want it listed publicly on Railway, also click **Publish**. If you don't, the link still works for anyone who has it.
 5. Copy the template's link (`https://railway.com/deploy/...`) and add the button to the README's "Run it 24/7 on Railway" section:

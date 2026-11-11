@@ -40,7 +40,13 @@ STATUS_EXPIRED_STALE = "EXPIRED_STALE"
 LIVE_CYCLE_LOG_HEADERS = [
     "Timestamp (UTC)", "Candle #", "Regime", "Close ($)", "Vault USDC ($)",
     "TB Value ($)", "TB #Pos", "RH Value ($)", "RH In Pos?", "Combined Equity ($)", "Notes",
+    # Added with the optional Savings Vault, after "Notes" so older rows keep
+    # their columns. "Vault USDC" is the wallet's cash; Combined Equity
+    # includes the Savings Vault.
+    "Savings Vault ($)", "Savings Yield ($)",
 ]
+SAVINGS_LOG_HEADERS = ["Timestamp (UTC)", "Cycle #", "Mode", "Action", "Amount ($)", "Status", "Tx Hash",
+                       "Vault Balance ($)", "Notes"]
 
 PENDING_TRADES_HEADERS = [
     "Proposal ID", "Created At (UTC)", "Engine", "Side", "Size (USD)", "Position ID",

@@ -44,6 +44,7 @@ from bot.scheduler import run_forever
 from bot.settings import SettingsError, load_settings
 from bot.swap_candles import candle_source_with_retries
 from bot.trend_core_history import warm_trend_core, HistoryError
+from bot.savings_vault import SavingsVault, SavingsSettings, RpcChain
 from bot.easy_setup import (MIN_ETH_FOR_GAS, MIN_USDC_TO_TRADE, keep_awake, remember_wallet,
                             wallet_mismatch)
 
@@ -117,7 +118,7 @@ def build_summary(orch: LiveOrchestrator, last_price: float) -> dict:
         "Warmup complete?": "Yes" if orch.warmup_done else f"No ({orch.candle_index + 1}/300)",
         "Current BTC price ($)": round(last_price, 2),
         "Current regime": {0: "RANGING", 1: "TRENDING_UP", 2: "TRENDING_DOWN", 3: "QUIET"}.get(orch.current_regime, "n/a"),
-        "USDC ($)": round(orch.vault.balance, 2),
+        "USDC ($)": round(orch.vault.wallet_cash, 2),
         "TB open positions": len(orch.tb.positions),
         "RH open position?": "Yes" if orch.rh.position else "No",
         "Combined equity ($)": round(equity, 2),
@@ -132,6 +133,7 @@ def build_summary(orch: LiveOrchestrator, last_price: float) -> dict:
         "Price staleness limit (%)": MAX_PRICE_STALENESS_PCT,
         "TWAP guard": (f"skip any trade if the pool price is over {MAX_TWAP_DEVIATION_PCT}% from its "
                        f"{TWAP_WINDOW_SECONDS // 60}-minute average"),
+        **(orch.savings.summary() if orch.savings is not None else {"Savings Vault mode": "OFF"}),
     }
 
 
@@ -165,7 +167,10 @@ def status_line(orch: LiveOrchestrator, close: float) -> str:
     else:
         core = f"Trend Core warming up ({tc['candles']}/768)"
     rh = "Range Harvester in a trade" if orch.rh.position else "Range Harvester waiting"
-    return f"BTC ${close:,.0f} | {core} | {rh} | USDC ${orch.vault.balance:,.2f} | total ${equity:,.2f}"
+    cash = f"USDC ${orch.vault.wallet_cash:,.2f}"
+    if orch.savings is not None:
+        cash += f" + Savings Vault ${orch.vault.savings_value:,.2f}"
+    return f"BTC ${close:,.0f} | {core} | {rh} | {cash} | total ${equity:,.2f}"
 
 
 def on_cycle_complete(orch: LiveOrchestrator, rec, store: LocalStore) -> None:
@@ -197,6 +202,49 @@ class LocalCandleStore:
 
     def save(self, builder_dict: dict) -> None:
         self.store.save_partial_candle(builder_dict)
+
+
+def setup_savings(orch: LiveOrchestrator, settings, store=None, chain=None) -> None:
+    """Attach the optional Savings Vault (bot/savings_vault.py; WHITELISTED
+    WALLETS ONLY). With the feature off it's still attached read-only when
+    the wallet holds vault shares, so equity counts that money. Never stops
+    the bot. Must run after orch.vault is final (MAX_TRADE_USD replaces it)."""
+    sset: SavingsSettings = settings.savings
+    can_send = sset.mode in ("on", "withdraw_all")
+    try:
+        chain = chain or RpcChain(MAINNET, settings.wallet_address, settings.private_key if can_send else None)
+        sv = SavingsVault(chain, settings.wallet_address, sset, MAINNET, state=orch.savings_saved_state)
+        warnings = sv.verify()
+    except Exception as e:  # noqa: BLE001
+        log.error("Savings Vault couldn't start (%s) -- it stays OFF; trading is unaffected.", e)
+        return
+    if sset.mode == "off":
+        if sv.status.shares == 0:
+            log.info("Savings Vault: off (SAVINGS_VAULT_MODE=off; it only works for wallets the vault's "
+                     "developers have registered).")
+            return
+        log.warning("Savings Vault is OFF but this wallet still has $%.2f in it. The bot counts it in your total "
+                    "but won't touch it; set SAVINGS_VAULT_MODE=withdraw_all to take it out.", sv.value_usd)
+    orch.attach_savings(sv)
+    for w in warnings:
+        log.warning("SAVINGS VAULT: %s", w)
+    st = sv.status
+    log.info("Savings Vault %s: $%.2f in it (%d shares); withdrawable now $%.2f; registered member: %s.",
+             sset.mode.upper(), sv.value_usd, st.shares, sv.withdrawable_raw() / 1e6, "yes" if st.member else "NO")
+    if sset.mode == "on":
+        log.warning("SAVINGS VAULT ON: idle USDC above $%.2f is deposited after each cycle (at most $%.2f per "
+                    "deposit, at least $%.2f), and withdrawn before buys.", sset.cash_buffer_usd,
+                    sset.max_deposit_usd, sset.min_deposit_usd)
+    elif sset.mode == "dry_run":
+        log.info("SAVINGS VAULT DRY RUN: savings_log.csv shows what would be deposited/withdrawn; nothing is sent.")
+    elif sset.mode == "withdraw_all":
+        log.warning("SAVINGS VAULT EMERGENCY WITHDRAW-ALL: taking everything out now; no deposits.")
+        actions: list = []
+        orch._savings_step(lambda: sv.withdraw_all(actions), actions)
+        for a in actions:
+            log.warning("  -> %s", a)
+        if store is not None:
+            store.save_state(serialize_live_state(orch))
 
 
 def preflight(address: str):
@@ -323,6 +371,7 @@ def main() -> None:
     if settings.max_trade_usd:
         orch.vault = CappedVault(settings.wallet_address, MAINNET, settings.max_trade_usd)
         log.info("MAX_TRADE_USD: no single buy will be larger than $%.2f.", settings.max_trade_usd)
+    setup_savings(orch, settings, store)
 
     awake = keep_awake()
     if awake:

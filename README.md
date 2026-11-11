@@ -144,8 +144,21 @@ The bot's log appears in Railway's **Deploy Logs**. The data files are on the vo
 | `CANDLE_SOURCE` | No | `swaps` (default): candles from every trade in the pool. `samples`: from 20-minute price samples |
 | `COINGECKO_API_KEY` | No | Only for the one-time history warm-up, if CoinGecko refuses requests without a key |
 | `WALLET_ADDRESS` | No | If set, must match the key's address (a safety check) |
+| `SAVINGS_VAULT_MODE` | No | The optional Savings Vault, **for whitelisted wallets only** (see below). `off` (default), `dry_run`, `on`, `withdraw_all` |
 
 Settings can live in `.env` or be set as environment variables. Environment variables take priority.
+
+## Optional: Savings Vault (whitelisted wallets only)
+
+**This is off by default, and it will not work for most people.** It only works if the developers of the Savings Vault (TakafulDAO) have registered *your* wallet as a member of their vault. With any other wallet the vault refuses every deposit, and the bot just reports "this wallet is not a registered member of the vault". If nobody has told you your wallet is registered, leave it off.
+
+What it does when it's on: USDC the strategy isn't using is deposited into the Savings Vault (`0x6d1bD94Cd572e51Aa018aE6Bf909BA61F8F8d4f9` on Arbitrum One, the only vault the bot will ever use) after each 4-hour cycle, where it earns a small yield. Before a buy, the bot takes out exactly what the trade needs. The vault sometimes pays part of a withdrawal in USDT; the bot swaps that back to USDC. Your total, profit figures and the strategy's sizing include the money in the vault.
+
+- **Modes** (`SAVINGS_VAULT_MODE`): `off` (default); `dry_run` writes what it *would* deposit and withdraw to `data/savings_log.csv` and sends nothing (try this first); `on`; `withdraw_all` is the emergency switch: the bot takes everything out of the vault (as fast as the vault's 24-hour withdrawal limits allow) and never deposits again.
+- **Limits:** `SAVINGS_MAX_DEPOSIT_USD` (largest single deposit, default 250), `SAVINGS_MIN_DEPOSIT_USD` (smallest, default 50), `SAVINGS_CASH_BUFFER_USD` (USDC always left in the wallet, default 5), `SAVINGS_MIN_ETH` (no vault transaction below this much ETH for gas, default 0.0005), `SAVINGS_EXPECTED_IDLE_DAYS` (a deposit has to earn back its gas within this many days, default 30). Approvals are always for the exact amount, never unlimited.
+- **The vault has its own safety limits.** Withdrawals are capped per 24 hours, per member and for the whole vault. Going over them pauses the vault for everyone, so the bot checks before every withdrawal and never goes near them. If money can't come out in time, the trade that needed it is skipped and the reason is logged.
+- **By hand:** `python scripts/savings_vault.py status` shows whether your wallet is registered and what's in the vault; `deposit`, `withdraw` and `withdraw-all` do it yourself, after you type YES.
+- Every deposit, withdrawal and alert is in `data/savings_log.csv`; the cycle log has two extra columns for the vault's balance and yield.
 
 ## Good to know
 

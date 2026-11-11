@@ -18,6 +18,20 @@ Optional settings (see .env.example):
                    nobody can type YES). Default "no".
   COINGECKO_API_KEY  only used once, for the history warm-up on a fresh start
   WALLET_ADDRESS   optional; if set, must match the address of the key
+
+  Optional Savings Vault (bot/savings_vault.py) -- WHITELISTED WALLETS ONLY.
+  It only works if the vault's developers (TakafulDAO) registered your
+  wallet as a member; otherwise leave it off (the default).
+  SAVINGS_VAULT_MODE        "off" (default), "dry_run" (shows what it would
+                            do, sends nothing), "on" (deposits idle USDC,
+                            withdraws before buys), "withdraw_all" (emergency:
+                            takes everything out, never deposits)
+  SAVINGS_MAX_DEPOSIT_USD   largest single deposit (default 250)
+  SAVINGS_MIN_DEPOSIT_USD   smallest deposit worth making (default 50)
+  SAVINGS_CASH_BUFFER_USD   USDC always left in the wallet (default 5)
+  SAVINGS_MIN_ETH           no vault transaction below this much ETH for gas (default 0.0005)
+  SAVINGS_EXPECTED_IDLE_DAYS  a deposit must earn back its gas within this many days (default 30)
+  SAVINGS_VAULT_ADDRESS     optional; if set it must be the one allowed vault
 """
 
 from __future__ import annotations
@@ -26,6 +40,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from .savings_vault import SavingsConfigError, SavingsSettings, load_settings as load_savings_settings
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,11 +77,12 @@ class Settings:
     coingecko_api_key: Optional[str]
     trend_core: bool = True
     auto_approve: bool = False
+    savings: SavingsSettings = SavingsSettings()
 
     def __repr__(self) -> str:      # never show the key, even by accident
         return (f"Settings(wallet_address={self.wallet_address!r}, data_dir={str(self.data_dir)!r}, "
                 f"max_trade_usd={self.max_trade_usd!r}, candle_source={self.candle_source!r}, "
-                f"trend_core={self.trend_core!r})")
+                f"trend_core={self.trend_core!r}, savings_mode={self.savings.mode!r})")
 
     __str__ = __repr__
 
@@ -111,7 +128,13 @@ def load_settings(env_file: Optional[Path] = None) -> Settings:
     if aa not in ("yes", "no"):
         raise SettingsError(f"AUTO_APPROVE must be 'yes' or 'no', got {aa!r}")
 
+    try:
+        savings = load_savings_settings(os.environ)
+    except SavingsConfigError as e:
+        raise SettingsError(f"Savings Vault setting problem: {e}. Fix it in .env (or remove the SAVINGS_ "
+                            f"lines to leave the Savings Vault off).") from None
+
     data_dir = Path(os.environ.get("DATA_DIR", "").strip() or ROOT / "data")
     return Settings(private_key=key, wallet_address=address, data_dir=data_dir, max_trade_usd=cap,
                     candle_source=source, coingecko_api_key=os.environ.get("COINGECKO_API_KEY") or None,
-                    trend_core=tc == "on", auto_approve=aa == "yes")
+                    trend_core=tc == "on", auto_approve=aa == "yes", savings=savings)

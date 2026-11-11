@@ -25,6 +25,13 @@ Phase order per cycle:
      balance by TB's proposed size before sizing RH.
   7. Persist state.
 
+Savings Vault (2026-11-10, bot/savings_vault.py, off unless attached): at
+the start of a cycle the vault is read; before any BUY, exactly the USDC the
+wallet is short of is withdrawn; at the end of the cycle, once every trade
+is done, idle USDC above the cash buffer (and above any BUY still waiting
+for approval) is deposited. A vault problem never stops a cycle; a BUY that
+can't be funded fails like any other failed BUY.
+
 Strategy v4 (2026-11-08): with trend_core=True the Trend Core
 (bot/trend_core.py) replaces the Trend Bot's entries. After the Range
 Harvester has acted, the Trend Core moves its own BTC holding towards its
@@ -56,6 +63,7 @@ from .live_proposals import (
     STATUS_EXPIRED_STALE,
 )
 from .live_execution import execute_buy, execute_sell, StalePriceError, ExecutionRevertedError
+from .live_wallet import LiveWalletError
 from .trend_core import TrendCore, MIN_TRADE_USD as TC_MIN_TRADE_USD, WARMUP as TC_WARMUP
 
 log = logging.getLogger("lifedao-bot.live_orchestrator")
@@ -76,6 +84,8 @@ class LiveCycleRecord:
     rh_open_position: bool
     warmup_done: bool
     actions: list = field(default_factory=list)
+    savings_value: float = 0.0     # Savings Vault balance (included in combined_equity)
+    savings_yield: float = 0.0     # lifetime yield earned in the Savings Vault
 
 
 class LiveOrchestrator:
@@ -107,6 +117,60 @@ class LiveOrchestrator:
         self.tc = TrendCore()
         self.tc_wbtc_qty = 0.0       # WBTC bought by the Trend Core and not yet sold
         self.tc_cost_usd = 0.0       # USDC paid for that WBTC (for realised P&L)
+
+        # The real Savings Vault (bot/savings_vault.py), attached by live_main.
+        self.savings = None
+        self.savings_saved_state: Optional[dict] = None    # kept when restored with the feature not attached
+        self._buy_to_retry = False
+
+    def attach_savings(self, savings) -> None:
+        self.savings = savings
+        self.vault.savings = savings
+
+    def _savings_step(self, fn, actions: list[str]) -> None:
+        """Run a Savings Vault step; any failure is reported, never raised."""
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- the vault must never stop a trading cycle
+            log.error("Savings Vault step failed (trading unaffected): %s", e)
+            actions.append(f"Savings vault error (trading unaffected): {e}")
+        finally:
+            self._flush_savings_log()
+
+    def _flush_savings_log(self) -> None:
+        if self.savings is None or not self.savings.log_rows:
+            return
+        rows, self.savings.log_rows = self.savings.log_rows, []
+        writer = getattr(self.proposals, "append_savings_log", None)
+        if writer is None:
+            return
+        try:
+            writer(rows)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Couldn't write %d Savings Vault log row(s) to savings_log.csv: %s", len(rows), e)
+
+    def _fund_buy(self, size_usd: float, actions: list[str]) -> None:
+        """Make sure the wallet holds `size_usd` USDC before a buy, taking
+        exactly the shortfall out of the Savings Vault. Raises LiveWalletError
+        (the buy is then recorded as failed) if it can't."""
+        sv = self.savings
+        if sv is None or not sv.can_send:
+            if sv is not None and sv.mode == "dry_run":
+                self._savings_step(lambda: sv.ensure_wallet_usdc(size_usd, actions), actions)
+            return
+        err = None
+        try:
+            have = sv.ensure_wallet_usdc(size_usd, actions)
+        except Exception as e:  # noqa: BLE001
+            err, have = e, None
+        finally:
+            self._flush_savings_log()
+        if have is None:
+            self.vault.refresh_balance()
+            have = self.vault.wallet_usdc
+        if have + 1e-6 < size_usd:
+            raise LiveWalletError(f"wallet has ${have:,.2f} USDC for a ${size_usd:,.2f} buy and the Savings Vault "
+                                  f"couldn't make up the difference" + (f": {err}" if err else ""))
 
     # -----------------------------------------------------------------
     def replay_candle_indicators_only(self, candle: Candle) -> None:
@@ -157,6 +221,11 @@ class LiveOrchestrator:
             self._current_day = candle_day
             self.tb.on_day_roll()
             self.rh.on_day_roll()
+
+        # ---- Savings Vault: resolve, read, alert (before any trade) ----
+        self._buy_to_retry = False
+        if self.savings is not None:
+            self._savings_step(lambda: self.savings.begin_cycle(idx, actions), actions)
 
         # ---- Phase 0: act on whatever a human has decided since last cycle ----
         # One read of all proposals for this entire cycle --
@@ -272,15 +341,38 @@ class LiveOrchestrator:
             else:
                 actions.append("Trend Core needs AUTO_EXECUTE=true to trade; it did nothing")
 
+        # ---- Savings Vault: every trade is done; deposit what's idle ----
+        if self.savings is not None:
+            self._sweep_savings(all_proposals, new_proposals_this_cycle, actions)
+
         tb_val_final, rh_val_final = self._position_value(candle.close)
         return LiveCycleRecord(
             candle_index=idx, timestamp=candle.timestamp, close=candle.close,
             regime_label=config.REGIME_LABELS[regime],
-            vault_usdc=self.vault.balance, tb_position_value=tb_val_final, rh_position_value=rh_val_final,
+            vault_usdc=self.vault.wallet_cash, tb_position_value=tb_val_final, rh_position_value=rh_val_final,
             combined_equity=self.vault.balance + tb_val_final + rh_val_final,
             tb_open_positions=len(self.tb.positions) + (1 if self.tc_wbtc_qty > 0 else 0), rh_open_position=self.rh.position is not None,
             warmup_done=self.warmup_done, actions=actions,
+            savings_value=self.vault.savings_value,
+            savings_yield=self.savings.yield_usd() if self.savings is not None else 0.0,
         )
+
+    def _sweep_savings(self, all_proposals: list, new_proposals: list, actions: list[str]) -> None:
+        """End of cycle. Keeps in the wallet: the cash buffer and every BUY
+        still waiting for a human's approval. Skips depositing when a buy
+        failed or was skipped this cycle (it's retried next cycle)."""
+        if self._buy_to_retry and self.savings.mode in ("on", "dry_run"):
+            actions.append("Savings: no deposit this cycle (a buy will be retried next cycle)")
+            return
+        waiting = [p for p in all_proposals if p.side == "BUY" and p.status == STATUS_PENDING]
+        if not self.auto_execute:
+            waiting += [p for p in new_proposals if p.side == "BUY" and p.status == STATUS_PENDING]
+        reserved = sum(p.size_usd for p in waiting)
+        self._savings_step(lambda: self.savings.sweep(reserved, actions), actions)
+        try:
+            self.vault.refresh_balance()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Balance refresh after the Savings Vault step failed: %s", e)
 
     # -----------------------------------------------------------------
     def _write_entry_proposal(self, pending_fill: PendingFill, candle: Candle) -> Proposal:
@@ -385,17 +477,21 @@ class LiveOrchestrator:
 
     def _handle_approved_buy(self, proposal: Proposal, candle: Candle, actions: list[str]) -> None:
         try:
+            self._fund_buy(proposal.size_usd, actions)
             fill_result = execute_buy(self.network, self.private_key, self.wallet_address,
                                        proposal.size_usd, proposal.price_at_proposal)
         except StalePriceError as e:
+            self._buy_to_retry = True
             self.proposals.update_status_by_id(proposal.proposal_id, "EXPIRED_STALE", Error=str(e))
             actions.append(f"BUY proposal {proposal.proposal_id} expired (stale price): {e}")
             return
         except ExecutionRevertedError as e:
+            self._buy_to_retry = True
             self.proposals.update_status_by_id(proposal.proposal_id, STATUS_FAILED, Error=str(e), **{"Tx Hash": e.tx_hash})
             actions.append(f"BUY proposal {proposal.proposal_id} reverted on-chain: {e}")
             return
         except Exception as e:   # noqa: BLE001 -- any other failure must still be recorded, not silently lost
+            self._buy_to_retry = True
             self.proposals.update_status_by_id(proposal.proposal_id, STATUS_FAILED, Error=str(e))
             actions.append(f"BUY proposal {proposal.proposal_id} failed: {e}")
             return
@@ -506,6 +602,7 @@ class LiveOrchestrator:
                      meta={"score": round(st["score"], 3), "target_usd": round(target, 2), "held_usd": round(held, 2)})
         try:
             if side == "BUY":
+                self._fund_buy(size, actions)
                 fill = execute_buy(self.network, self.private_key, self.wallet_address, size, close)
                 self.tc_wbtc_qty += fill.wbtc_qty
                 self.tc_cost_usd += fill.usd_value
@@ -525,11 +622,13 @@ class LiveOrchestrator:
                 msg = (f"TC SELL executed: {fill.wbtc_qty:.8f} WBTC for ${fill.usd_value:,.2f} @ "
                        f"${fill.fill_price:,.2f}, realised P&L ${pnl:,.2f}")
         except StalePriceError as e:     # includes the TWAP guard
+            self._buy_to_retry = self._buy_to_retry or side == "BUY"
             p.status, p.error = STATUS_EXPIRED_STALE, str(e)
             actions.append(info + f" -- {side} skipped: {e}")
             self._log_tc_row(p, executed=False)
             return
         except Exception as e:   # noqa: BLE001 -- recorded, retried next cycle
+            self._buy_to_retry = self._buy_to_retry or side == "BUY"
             p.status, p.error = STATUS_FAILED, str(e)
             actions.append(info + f" -- {side} failed: {e}")
             self._log_tc_row(p, executed=False)
